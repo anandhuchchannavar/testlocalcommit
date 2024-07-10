@@ -1,0 +1,136 @@
+To create a real-time chat application with two windows for communication using Spring Boot for the backend and Java Swing for the frontend, you can follow these steps. This example will demonstrate how two clients can communicate with each other in real-time.Step 1: Set Up Spring Boot gRPC Server1. Create a Spring Boot ProjectUse Spring Initializr to create a Spring Boot project with the necessary dependencies for gRPC.2. Define gRPC ServiceCreate a chat.proto file for your chat service:syntax = "proto3";
+
+option java_multiple_files = true;
+option java_package = "com.example.grpc";
+option java_outer_classname = "ChatProto";
+
+service ChatService {
+  rpc SendMessage(stream ChatMessage) returns (stream ChatResponse);
+}
+
+message ChatMessage {
+  string user = 1;
+  string message = 2;
+}
+
+message ChatResponse {
+  string user = 1;
+  string message = 2;
+}3. Generate gRPC ClassesUse the gRPC Java plugin to generate the necessary classes from the .proto file.4. Implement gRPC ServiceCreate the service implementation in your Spring Boot application:package com.example.grpc;
+
+import io.grpc.stub.StreamObserver;
+import net.devh.boot.grpc.server.service.GrpcService;
+
+import java.util.ArrayList;
+import java.util.List;
+
+@GrpcService
+public class ChatServiceImpl extends ChatServiceGrpc.ChatServiceImplBase {
+
+    private final List<StreamObserver<ChatResponse>> observers = new ArrayList<>();
+
+    @Override
+    public StreamObserver<ChatMessage> sendMessage(StreamObserver<ChatResponse> responseObserver) {
+        observers.add(responseObserver);
+
+        return new StreamObserver<ChatMessage>() {
+            @Override
+            public void onNext(ChatMessage chatMessage) {
+                ChatResponse chatResponse = ChatResponse.newBuilder()
+                        .setUser(chatMessage.getUser())
+                        .setMessage(chatMessage.getMessage())
+                        .build();
+
+                for (StreamObserver<ChatResponse> observer : observers) {
+                    observer.onNext(chatResponse);
+                }
+            }
+
+            @Override
+            public void onError(Throwable t) {
+                observers.remove(responseObserver);
+            }
+
+            @Override
+            public void onCompleted() {
+                observers.remove(responseObserver);
+                responseObserver.onCompleted();
+            }
+        };
+    }
+}5. Configure gRPCAdd the gRPC server configuration in your application.properties file:grpc.server.port=9090Step 2: Set Up Java Swing Client1. Create a Java Swing ApplicationCreate a simple Swing application with a text area for messages and text fields for input.2. Integrate gRPC ClientSet up a gRPC client in your Swing application to communicate with the Spring Boot gRPC server.package com.example.swingclient;
+
+import com.example.grpc.ChatServiceGrpc;
+import com.example.grpc.ChatProto.ChatMessage;
+import com.example.grpc.ChatProto.ChatResponse;
+import io.grpc.ManagedChannel;
+import io.grpc.ManagedChannelBuilder;
+import io.grpc.stub.StreamObserver;
+
+import javax.swing.*;
+import java.awt.event.ActionEvent;
+import java.awt.event.ActionListener;
+
+public class ChatClient {
+
+    private static ChatServiceGrpc.ChatServiceStub asyncStub;
+
+    public static void main(String[] args) {
+        ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 9090)
+                .usePlaintext()
+                .build();
+
+        asyncStub = ChatServiceGrpc.newStub(channel);
+
+        createChatWindow("User1");
+        createChatWindow("User2");
+    }
+
+    private static void createChatWindow(String username) {
+        JFrame frame = new JFrame("Chat Client - " + username);
+        JTextArea textArea = new JTextArea(20, 50);
+        JTextField messageField = new JTextField(30);
+        JButton sendButton = new JButton("Send");
+
+        JPanel panel = new JPanel();
+        panel.add(new JLabel("Message:"));
+        panel.add(messageField);
+        panel.add(sendButton);
+
+        frame.getContentPane().add(new JScrollPane(textArea), "Center");
+        frame.getContentPane().add(panel, "South");
+        frame.pack();
+        frame.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
+        frame.setVisible(true);
+
+        StreamObserver<ChatMessage> requestObserver = asyncStub.sendMessage(new StreamObserver<ChatResponse>() {
+            @Override
+            public void onNext(ChatResponse chatResponse) {
+                textArea.append("[" + chatResponse.getUser() + "]: " + chatResponse.getMessage() + "\n");
+            }
+
+            @Override
+            public void onError(Throwable t) {
+                t.printStackTrace();
+            }
+
+            @Override
+            public void onCompleted() {
+                // Do nothing
+            }
+        });
+
+        sendButton.addActionListener(new ActionListener() {
+            @Override
+            public void actionPerformed(ActionEvent e) {
+                String message = messageField.getText();
+                ChatMessage chatMessage = ChatMessage.newBuilder()
+                        .setUser(username)
+                        .setMessage(message)
+                        .build();
+                requestObserver.onNext(chatMessage);
+                messageField.setText("");
+            }
+        });
+    }
+}Step 3: Run the ApplicationRun the Spring Boot application to start the gRPC server.Run the Swing client application. Two windows should open, each representing a different user. You should be able to send and receive messages in real-time between these two windows.This setup provides a basic real-time chat application with two clients communicating through a gRPC server. You can expand upon this by adding more features like user authentication, message history, and a more sophisticated UI.
