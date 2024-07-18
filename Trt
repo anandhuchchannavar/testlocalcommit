@@ -1,0 +1,5 @@
+protoc -I . -I $GOPATH/src/github.com/grpc-ecosystem/grpc-gateway/third_party/googleapis \
+    --grpc-java_out=src/main/java \
+    --grpc-gateway_out=logtostderr=true:src/main/java \
+    --openapi_out=logtostderr=true:src/main/resources/openapi \
+    src/main/proto/your_service.proto
