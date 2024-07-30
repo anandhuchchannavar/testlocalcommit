@@ -1,0 +1,209 @@
+Sure, let's complete the Spring Boot code to handle sending files from the Swing interface to the client. Here is the updated Spring Boot code:
+
+### Spring Boot Server Code with File Sending
+
+1. **Update Dependencies in `build.gradle`:**
+
+Ensure you have the dependencies:
+
+```groovy
+dependencies {
+    implementation 'org.springframework.boot:spring-boot-starter'
+    implementation 'net.devh:grpc-server-spring-boot-starter:2.12.0.RELEASE'
+    implementation 'net.devh:grpc-client-spring-boot-starter:2.12.0.RELEASE'
+    implementation 'com.google.protobuf:protobuf-java:3.15.6'
+}
+```
+
+2. **Update the `ChatServiceImpl` Class:**
+
+Complete the gRPC service implementation to handle file sending.
+
+```java
+import io.grpc.stub.StreamObserver;
+import net.devh.boot.grpc.server.service.GrpcService;
+import chat.ChatServiceGrpc;
+import chat.Chat.*;
+
+import javax.swing.*;
+import java.awt.*;
+import java.awt.event.ActionEvent;
+import java.awt.event.ActionListener;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
+
+@GrpcService
+public class ChatServiceImpl extends ChatServiceGrpc.ChatServiceImplBase {
+
+    private final BlockingQueue<MessageResponse> messageQueue = new LinkedBlockingQueue<>();
+    private final BlockingQueue<FileResponse> fileQueue = new LinkedBlockingQueue<>();
+
+    @Override
+    public void sendMessage(MessageRequest request, StreamObserver<MessageResponse> responseObserver) {
+        MessageResponse response = MessageResponse.newBuilder()
+                .setMessage(request.getMessage())
+                .setSender("Server")
+                .build();
+        messageQueue.add(response);
+        responseObserver.onNext(response);
+        responseObserver.onCompleted();
+    }
+
+    @Override
+    public void sendFile(FileRequest request, StreamObserver<FileResponse> responseObserver) {
+        FileResponse response = FileResponse.newBuilder()
+                .setFile(request.getFile())
+                .setFilename(request.getFilename())
+                .setSender("Server")
+                .build();
+        fileQueue.add(response);
+        responseObserver.onNext(response);
+        responseObserver.onCompleted();
+    }
+
+    @Override
+    public void receiveMessage(ReceiveRequest request, StreamObserver<MessageResponse> responseObserver) {
+        new Thread(() -> {
+            while (true) {
+                try {
+                    responseObserver.onNext(messageQueue.take());
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    responseObserver.onError(e);
+                }
+            }
+        }).start();
+    }
+
+    @Override
+    public void receiveFile(ReceiveRequest request, StreamObserver<FileResponse> responseObserver) {
+        new Thread(() -> {
+            while (true) {
+                try {
+                    responseObserver.onNext(fileQueue.take());
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    responseObserver.onError(e);
+                }
+            }
+        }).start();
+    }
+
+    public static void main(String[] args) {
+        SwingUtilities.invokeLater(ChatServerGui::new);
+    }
+}
+
+class ChatServerGui extends JFrame {
+
+    private JTextArea messageArea;
+    private JTextField messageInput;
+    private JButton sendButton;
+    private JButton fileButton;
+
+    public ChatServerGui() {
+        setTitle("Server Chat");
+        setSize(400, 300);
+        setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
+
+        messageArea = new JTextArea();
+        messageArea.setEditable(false);
+        add(new JScrollPane(messageArea), BorderLayout.CENTER);
+
+        JPanel panel = new JPanel();
+        messageInput = new JTextField(20);
+        sendButton = new JButton("Send");
+        fileButton = new JButton("Send File");
+        panel.add(messageInput);
+        panel.add(sendButton);
+        panel.add(fileButton);
+        add(panel, BorderLayout.SOUTH);
+
+        sendButton.addActionListener(new SendButtonListener());
+        fileButton.addActionListener(new FileButtonListener());
+
+        setVisible(true);
+    }
+
+    private class SendButtonListener implements ActionListener {
+        public void actionPerformed(ActionEvent e) {
+            String message = messageInput.getText();
+            if (!message.isEmpty()) {
+                messageArea.append("Server: " + message + "\n");
+                messageInput.setText("");
+                sendMessageToClient(message);
+            }
+        }
+    }
+
+    private class FileButtonListener implements ActionListener {
+        public void actionPerformed(ActionEvent e) {
+            JFileChooser fileChooser = new JFileChooser();
+            int result = fileChooser.showOpenDialog(ChatServerGui.this);
+            if (result == JFileChooser.APPROVE_OPTION) {
+                String filePath = fileChooser.getSelectedFile().getPath();
+                String fileName = fileChooser.getSelectedFile().getName();
+                sendFileToClient(filePath, fileName);
+            }
+        }
+    }
+
+    private void sendMessageToClient(String message) {
+        try {
+            // Create a channel and a stub
+            ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 50051).usePlaintext().build();
+            ChatServiceGrpc.ChatServiceBlockingStub stub = ChatServiceGrpc.newBlockingStub(channel);
+
+            // Send the message
+            MessageRequest request = MessageRequest.newBuilder().setMessage(message).build();
+            stub.sendMessage(request);
+
+            // Close the channel
+            channel.shutdown();
+        } catch (Exception ex) {
+            ex.printStackTrace();
+        }
+    }
+
+    private void sendFileToClient(String filePath, String fileName) {
+        try {
+            byte[] fileContent = Files.readAllBytes(Paths.get(filePath));
+
+            // Create a channel and a stub
+            ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 50051).usePlaintext().build();
+            ChatServiceGrpc.ChatServiceBlockingStub stub = ChatServiceGrpc.newBlockingStub(channel);
+
+            // Send the file
+            FileRequest request = FileRequest.newBuilder().setFile(ByteString.copyFrom(fileContent)).setFilename(fileName).build();
+            stub.sendFile(request);
+
+            // Close the channel
+            channel.shutdown();
+        } catch (Exception ex) {
+            ex.printStackTrace();
+        }
+    }
+}
+```
+
+### Explanation:
+
+1. **SendButtonListener:**
+   - When the "Send" button is clicked, it sends a message to the client using gRPC.
+
+2. **FileButtonListener:**
+   - When the "Send File" button is clicked, it opens a file chooser to select a file.
+   - The selected file's path and name are used to read the file's content and send it to the client using gRPC.
+
+3. **sendMessageToClient Method:**
+   - Establishes a gRPC channel and stub.
+   - Sends a text message to the client using the gRPC `sendMessage` method.
+
+4. **sendFileToClient Method:**
+   - Reads the selected file's content.
+   - Establishes a gRPC channel and stub.
+   - Sends the file to the client using the gRPC `sendFile` method.
+
+With these updates, the Spring Boot server can send messages and files to the client via the Swing interface, and the client can handle and display these messages and files appropriately.
