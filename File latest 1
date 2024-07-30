@@ -1,0 +1,301 @@
+To handle downloading files on both the client and server sides, we need to update the gRPC service definition and the implementations to support this functionality. We'll add methods for receiving files and ensure the UI components can handle incoming files.
+
+### Step 1: Update the gRPC Service Definition
+
+Update the `.proto` file to include methods for receiving files.
+
+```protobuf
+syntax = "proto3";
+
+option java_package = "com.example.grpc";
+option java_outer_classname = "ChatServiceProto";
+
+service ChatService {
+    rpc SendMessage (ChatMessage) returns (Empty);
+    rpc SendFile (FileMessage) returns (Empty);
+    rpc ReceiveFile (Empty) returns (stream FileMessage);
+}
+
+message ChatMessage {
+    string message = 1;
+}
+
+message FileMessage {
+    string filename = 1;
+    bytes filedata = 2;
+}
+
+message Empty {}
+```
+
+### Step 2: Implement the Spring Boot gRPC Server
+
+#### 1. Update the gRPC Service Implementation
+
+```java
+import com.example.grpc.ChatServiceGrpc;
+import com.example.grpc.ChatServiceProto;
+import com.google.protobuf.ByteString;
+import io.grpc.stub.StreamObserver;
+import org.springframework.stereotype.Service;
+
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.nio.file.Files;
+
+@Service
+public class ChatServiceImpl extends ChatServiceGrpc.ChatServiceImplBase {
+
+    private StreamObserver<ChatServiceProto.FileMessage> clientStreamObserver;
+
+    @Override
+    public void sendMessage(ChatServiceProto.ChatMessage request, StreamObserver<ChatServiceProto.Empty> responseObserver) {
+        String message = request.getMessage();
+        // Handle the message
+        System.out.println("Received message: " + message);
+
+        responseObserver.onNext(ChatServiceProto.Empty.newBuilder().build());
+        responseObserver.onCompleted();
+    }
+
+    @Override
+    public void sendFile(ChatServiceProto.FileMessage request, StreamObserver<ChatServiceProto.Empty> responseObserver) {
+        String filename = request.getFilename();
+        byte[] filedata = request.getFiledata().toByteArray();
+        // Handle the file
+        System.out.println("Received file: " + filename);
+
+        // Save the file to the server
+        try {
+            File file = new File(filename);
+            FileOutputStream fos = new FileOutputStream(file);
+            fos.write(filedata);
+            fos.close();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+
+        // Notify the client about the file
+        if (clientStreamObserver != null) {
+            clientStreamObserver.onNext(request);
+        }
+
+        responseObserver.onNext(ChatServiceProto.Empty.newBuilder().build());
+        responseObserver.onCompleted();
+    }
+
+    @Override
+    public void receiveFile(ChatServiceProto.Empty request, StreamObserver<ChatServiceProto.FileMessage> responseObserver) {
+        this.clientStreamObserver = responseObserver;
+    }
+}
+```
+
+### Step 3: Implement the Python gRPC Client
+
+#### 1. Update the Python Client to Handle File Downloads
+
+```python
+import sys
+import grpc
+import threading
+from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QPushButton, QTextEdit, QFileDialog, QMessageBox
+from chat_service_pb2 import ChatMessage, FileMessage, Empty
+from chat_service_pb2_grpc import ChatServiceStub, ChatServiceServicer, add_ChatServiceServicer_to_server
+
+class ChatClient(QWidget):
+    def __init__(self):
+        super().__init__()
+
+        self.channel = grpc.insecure_channel('localhost:50051')
+        self.stub = ChatServiceStub(self.channel)
+
+        self.initUI()
+        self.start_receive_file_thread()
+
+    def initUI(self):
+        self.layout = QVBoxLayout()
+
+        self.message_box = QTextEdit(self)
+        self.layout.addWidget(self.message_box)
+
+        self.send_button = QPushButton('Send Message', self)
+        self.send_button.clicked.connect(self.send_message)
+        self.layout.addWidget(self.send_button)
+
+        self.send_file_button = QPushButton('Send File', self)
+        self.send_file_button.clicked.connect(self.send_file)
+        self.layout.addWidget(self.send_file_button)
+
+        self.setLayout(self.layout)
+        self.setWindowTitle('Chat Client')
+        self.show()
+
+    def send_message(self):
+        message = self.message_box.toPlainText()
+        chat_message = ChatMessage(message=message)
+        response = self.stub.SendMessage(chat_message)
+        print("Message sent")
+
+    def send_file(self):
+        options = QFileDialog.Options()
+        file_path, _ = QFileDialog.getOpenFileName(self, "Open File", "", "All Files (*)", options=options)
+        if file_path:
+            with open(file_path, 'rb') as file:
+                file_data = file.read()
+                file_message = FileMessage(filename=file_path, filedata=file_data)
+                response = self.stub.SendFile(file_message)
+                print("File sent")
+
+    def start_receive_file_thread(self):
+        thread = threading.Thread(target=self.receive_files)
+        thread.start()
+
+    def receive_files(self):
+        for file_message in self.stub.ReceiveFile(Empty()):
+            filename = file_message.filename
+            filedata = file_message.filedata
+
+            with open(filename, 'wb') as file:
+                file.write(filedata)
+                print(f"File received: {filename}")
+                self.show_file_received_message(filename)
+
+    def show_file_received_message(self, filename):
+        QMessageBox.information(self, "File Received", f"File {filename} has been received.")
+
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    client = ChatClient()
+    sys.exit(app.exec_())
+```
+
+### Step 4: Update the Spring Boot GUI to Handle File Downloads
+
+#### 1. Implement the Java Swing GUI with File Download Handling
+
+```java
+import javax.swing.*;
+import java.awt.*;
+import java.awt.event.ActionEvent;
+import java.awt.event.ActionListener;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.nio.file.Files;
+
+public class ChatServerGUI extends JFrame {
+
+    private JTextArea messageArea;
+    private JButton sendButton;
+    private JButton sendFileButton;
+    private ChatServiceImpl chatService;
+
+    public ChatServerGUI(ChatServiceImpl chatService) {
+        this.chatService = chatService;
+        initUI();
+    }
+
+    private void initUI() {
+        setTitle("Chat Server");
+
+        messageArea = new JTextArea();
+        sendButton = new JButton("Send Message");
+        sendFileButton = new JButton("Send File");
+
+        sendButton.addActionListener(new ActionListener() {
+            @Override
+            public void actionPerformed(ActionEvent e) {
+                sendMessage();
+            }
+        });
+
+        sendFileButton.addActionListener(new ActionListener() {
+            @Override
+            public void actionPerformed(ActionEvent e) {
+                sendFile();
+            }
+        });
+
+        JPanel panel = new JPanel();
+        panel.setLayout(new BorderLayout());
+        panel.add(new JScrollPane(messageArea), BorderLayout.CENTER);
+
+        JPanel buttonPanel = new JPanel();
+        buttonPanel.setLayout(new FlowLayout());
+        buttonPanel.add(sendButton);
+        buttonPanel.add(sendFileButton);
+
+        panel.add(buttonPanel, BorderLayout.SOUTH);
+
+        add(panel);
+
+        setSize(400, 300);
+        setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
+        setLocationRelativeTo(null);
+    }
+
+    private void sendMessage() {
+        String message = messageArea.getText();
+        ChatServiceProto.ChatMessage chatMessage = ChatServiceProto.ChatMessage.newBuilder()
+                .setMessage(message)
+                .build();
+        chatService.sendMessage(chatMessage, new StreamObserver<ChatServiceProto.Empty>() {
+            @Override
+            public void onNext(ChatServiceProto.Empty value) {}
+
+            @Override
+            public void onError(Throwable t) {}
+
+            @Override
+            public void onCompleted() {
+                System.out.println("Message sent");
+            }
+        });
+    }
+
+    private void sendFile() {
+        JFileChooser fileChooser = new JFileChooser();
+        int returnValue = fileChooser.showOpenDialog(null);
+        if (returnValue == JFileChooser.APPROVE_OPTION) {
+            File selectedFile = fileChooser.getSelectedFile();
+            try {
+                byte[] fileData = Files.readAllBytes(selectedFile.toPath());
+                ChatServiceProto.FileMessage fileMessage = ChatServiceProto.FileMessage.newBuilder()
+                        .setFilename(selectedFile.getName())
+                        .setFiledata(ByteString.copyFrom(fileData))
+                        .build();
+                chatService.sendFile(fileMessage, new StreamObserver<ChatServiceProto.Empty>() {
+                    @Override
+                    public void onNext(ChatServiceProto.Empty value) {}
+
+                    @Override
+                    public void onError(Throwable t) {}
+
+                    @Override
+                    public void onCompleted() {
+                        System.out.println("File sent");
+                    }
+                });
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }
+    }
+
+    public static void main(String[] args) {
+        SwingUtilities.invokeLater(() -> {
+            ChatServiceImpl chatService = new ChatServiceImpl();
+            ChatServerGUI serverGUI = new ChatServerGUI(chatService);
+            serverGUI.setVisible(true);
+        });
+    }
+}
+```
+
+### Step 5: Ensure Both Client and Server Can Handle Incoming Files
+
+To ensure that both the client and the server can handle incoming files, they should implement similar logic for receiving files. In the provided implementation, the server streams files to the client, and the client saves the received files locally. You can extend the server's logic to handle received files from the client in a similar manner if needed.
+
+With these updates, the client and server applications will be able to send and receive both messages and files, ensuring smooth communication between them.
