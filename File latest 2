@@ -1,0 +1,211 @@
+To create a client chat window using `tkinter` in Python, we'll implement the chat window with a text box for messages, a button to send messages, and a button to send files. The window will also handle receiving files from the server.
+
+Here’s the complete implementation:
+
+### Step 1: Install the required dependencies
+
+Ensure you have `grpcio` and `grpcio-tools` installed:
+```sh
+pip install grpcio grpcio-tools
+```
+
+### Step 2: Define the gRPC Service
+
+Ensure you have the following `.proto` file saved as `chat_service.proto`:
+
+```proto
+syntax = "proto3";
+
+option java_package = "com.example.grpc";
+option java_outer_classname = "ChatServiceProto";
+
+service ChatService {
+    rpc SendMessage (ChatMessage) returns (Empty);
+    rpc SendFile (FileMessage) returns (Empty);
+    rpc ReceiveFile (Empty) returns (stream FileMessage);
+}
+
+message ChatMessage {
+    string message = 1;
+}
+
+message FileMessage {
+    string filename = 1;
+    bytes filedata = 2;
+}
+
+message Empty {}
+```
+
+Generate the Python code from the `.proto` file:
+```sh
+python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. chat_service.proto
+```
+
+### Step 3: Implement the Python gRPC Client with `tkinter`
+
+```python
+import grpc
+import threading
+import tkinter as tk
+from tkinter import filedialog, messagebox
+from chat_service_pb2 import ChatMessage, FileMessage, Empty
+from chat_service_pb2_grpc import ChatServiceStub
+
+class ChatClient:
+    def __init__(self, master):
+        self.master = master
+        self.master.title("Chat Client")
+
+        self.channel = grpc.insecure_channel('localhost:50051')
+        self.stub = ChatServiceStub(self.channel)
+
+        self.message_box = tk.Text(master, height=15, width=50)
+        self.message_box.pack()
+
+        self.send_button = tk.Button(master, text="Send Message", command=self.send_message)
+        self.send_button.pack()
+
+        self.send_file_button = tk.Button(master, text="Send File", command=self.send_file)
+        self.send_file_button.pack()
+
+        self.start_receive_file_thread()
+
+    def send_message(self):
+        message = self.message_box.get("1.0", tk.END).strip()
+        if message:
+            chat_message = ChatMessage(message=message)
+            self.stub.SendMessage(chat_message)
+            print("Message sent")
+
+    def send_file(self):
+        file_path = filedialog.askopenfilename()
+        if file_path:
+            with open(file_path, 'rb') as file:
+                file_data = file.read()
+                file_message = FileMessage(filename=file_path, filedata=file_data)
+                self.stub.SendFile(file_message)
+                print("File sent")
+
+    def start_receive_file_thread(self):
+        thread = threading.Thread(target=self.receive_files)
+        thread.daemon = True
+        thread.start()
+
+    def receive_files(self):
+        for file_message in self.stub.ReceiveFile(Empty()):
+            filename = file_message.filename.split('/')[-1]  # Get the file name only
+            filedata = file_message.filedata
+
+            with open(filename, 'wb') as file:
+                file.write(filedata)
+                print(f"File received: {filename}")
+                self.show_file_received_message(filename)
+
+    def show_file_received_message(self, filename):
+        messagebox.showinfo("File Received", f"File {filename} has been received.")
+
+if __name__ == '__main__':
+    root = tk.Tk()
+    client = ChatClient(root)
+    root.mainloop()
+```
+
+### Step 4: Implement the Spring Boot gRPC Server
+
+#### 1. Add dependencies to `build.gradle` or `pom.xml`
+
+For Gradle:
+```groovy
+implementation 'net.devh:grpc-spring-boot-starter:2.13.0.RELEASE'
+implementation 'com.google.protobuf:protobuf-java:3.21.12'
+implementation 'io.grpc:grpc-protobuf:1.45.1'
+implementation 'io.grpc:grpc-stub:1.45.1'
+implementation 'io.grpc:grpc-netty-shaded:1.45.1'
+```
+
+#### 2. Generate the gRPC classes
+
+Generate the Java classes from the `.proto` file using the `protobuf-gradle-plugin` or similar.
+
+#### 3. Implement the gRPC Service
+
+```java
+import com.example.grpc.ChatServiceGrpc;
+import com.example.grpc.ChatServiceProto;
+import com.google.protobuf.ByteString;
+import io.grpc.stub.StreamObserver;
+import org.springframework.stereotype.Service;
+
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+
+@Service
+public class ChatServiceImpl extends ChatServiceGrpc.ChatServiceImplBase {
+
+    private StreamObserver<ChatServiceProto.FileMessage> clientStreamObserver;
+
+    @Override
+    public void sendMessage(ChatServiceProto.ChatMessage request, StreamObserver<ChatServiceProto.Empty> responseObserver) {
+        String message = request.getMessage();
+        System.out.println("Received message: " + message);
+
+        responseObserver.onNext(ChatServiceProto.Empty.newBuilder().build());
+        responseObserver.onCompleted();
+    }
+
+    @Override
+    public void sendFile(ChatServiceProto.FileMessage request, StreamObserver<ChatServiceProto.Empty> responseObserver) {
+        String filename = request.getFilename();
+        byte[] filedata = request.getFiledata().toByteArray();
+        System.out.println("Received file: " + filename);
+
+        try {
+            File file = new File(filename);
+            try (FileOutputStream fos = new FileOutputStream(file)) {
+                fos.write(filedata);
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+
+        if (clientStreamObserver != null) {
+            clientStreamObserver.onNext(request);
+        }
+
+        responseObserver.onNext(ChatServiceProto.Empty.newBuilder().build());
+        responseObserver.onCompleted();
+    }
+
+    @Override
+    public void receiveFile(ChatServiceProto.Empty request, StreamObserver<ChatServiceProto.FileMessage> responseObserver) {
+        this.clientStreamObserver = responseObserver;
+    }
+}
+```
+
+#### 4. Configure the gRPC Server
+
+```java
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.context.annotation.Bean;
+import net.devh.boot.grpc.server.serverfactory.GrpcServerFactory;
+import net.devh.boot.grpc.server.serverfactory.NettyGrpcServerFactory;
+
+@SpringBootApplication
+public class GrpcServerApplication {
+
+    public static void main(String[] args) {
+        SpringApplication.run(GrpcServerApplication.class, args);
+    }
+
+    @Bean
+    public GrpcServerFactory grpcServerFactory() {
+        return new NettyGrpcServerFactory();
+    }
+}
+```
+
+This setup will provide a fully functional chat application where the Python client can send and receive messages and files using `tkinter` for the GUI and a Spring Boot server. Both client and server can handle incoming files appropriately.
