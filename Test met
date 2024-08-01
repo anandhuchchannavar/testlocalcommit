@@ -150,3 +150,119 @@ To track and monitor gRPC calls in a Spring Boot application and display them on
    - Use the Jaeger or Zipkin UI to visualize and analyze traces.
 
 By following these steps, you will have a comprehensive setup to track and monitor gRPC calls in your Spring Boot application and display the metrics and traces on a dashboard.
+
+
+
+
+The "Failed to export spans" error usually occurs when there is a problem with the OpenTelemetry exporter configuration or the tracing backend (like Jaeger or Zipkin) is not properly set up or reachable.
+
+### Troubleshooting Steps
+
+1. **Verify Exporter Configuration**:
+   Ensure that the exporter configuration in your Spring Boot application is correct.
+
+2. **Check Backend Availability**:
+   Make sure that Jaeger or Zipkin is running and accessible from your Spring Boot application. You can verify this by navigating to the respective UI in your browser:
+   - Jaeger: `http://localhost:14268` (default collector endpoint)
+   - Zipkin: `http://localhost:9411` (default collector endpoint)
+
+3. **Check Network Configuration**:
+   If your application is running in a container or different network, ensure that network settings allow communication with the tracing backend.
+
+### Example Configuration for OpenTelemetry with Jaeger
+
+Here is a complete example of how to configure OpenTelemetry with Jaeger in a Spring Boot application:
+
+**Dependencies in `pom.xml`**:
+
+```xml
+<dependency>
+    <groupId>io.opentelemetry</groupId>
+    <artifactId>opentelemetry-api</artifactId>
+</dependency>
+<dependency>
+    <groupId>io.opentelemetry</groupId>
+    <artifactId>opentelemetry-sdk</artifactId>
+</dependency>
+<dependency>
+    <groupId>io.opentelemetry</groupId>
+    <artifactId>opentelemetry-exporter-jaeger</artifactId>
+</dependency>
+<dependency>
+    <groupId>io.grpc</groupId>
+    <artifactId>grpc-core</artifactId>
+</dependency>
+```
+
+**OpenTelemetry Configuration Class**:
+
+```java
+import io.opentelemetry.api.GlobalOpenTelemetry;
+import io.opentelemetry.api.trace.Tracer;
+import io.opentelemetry.sdk.OpenTelemetrySdk;
+import io.opentelemetry.sdk.trace.SdkTracerProvider;
+import io.opentelemetry.sdk.trace.export.BatchSpanProcessor;
+import io.opentelemetry.exporter.jaeger.JaegerGrpcSpanExporter;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+@Configuration
+public class OpenTelemetryConfig {
+
+    @Bean
+    public Tracer tracer() {
+        // Configure Jaeger exporter
+        JaegerGrpcSpanExporter jaegerExporter = JaegerGrpcSpanExporter.builder()
+                .setEndpoint("http://localhost:14250") // default Jaeger endpoint for gRPC
+                .build();
+
+        // Configure span processor
+        SdkTracerProvider tracerProvider = SdkTracerProvider.builder()
+                .addSpanProcessor(BatchSpanProcessor.builder(jaegerExporter).build())
+                .build();
+
+        OpenTelemetrySdk openTelemetry = OpenTelemetrySdk.builder()
+                .setTracerProvider(tracerProvider)
+                .build();
+
+        GlobalOpenTelemetry.set(openTelemetry);
+
+        return openTelemetry.getTracer("your-service-name");
+    }
+}
+```
+
+**Jaeger Configuration**:
+
+Make sure Jaeger is running with the correct configuration. You can use Docker to run Jaeger:
+
+```sh
+docker run -d --name jaeger \
+  -e COLLECTOR_ZIPKIN_HTTP_PORT=9411 \
+  -p 5775:5775/udp \
+  -p 6831:6831/udp \
+  -p 6832:6832/udp \
+  -p 5778:5778 \
+  -p 16686:16686 \
+  -p 14250:14250 \
+  -p 14268:14268 \
+  -p 14269:14269 \
+  -p 9411:9411 \
+  jaegertracing/all-in-one:1.21
+```
+
+### Verify Span Export
+
+After setting up the configuration, run your Spring Boot application and check the logs for any errors related to span export. You should see spans in the Jaeger UI at `http://localhost:16686`.
+
+### Additional Debugging
+
+If the issue persists, consider enabling debug logging for OpenTelemetry to get more detailed information about what might be going wrong:
+
+**application.properties**:
+
+```properties
+logging.level.io.opentelemetry=DEBUG
+```
+
+This will provide more detailed logs that can help in diagnosing the issue with span export.
