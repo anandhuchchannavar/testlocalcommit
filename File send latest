@@ -314,3 +314,145 @@ if __name__ == "__main__":
 ```
 
 ### 5.
+
+### 5. Implement File Transfer Handling
+
+Ensure both the client and server can handle file uploads and downloads correctly. This involves setting up the necessary file handling in both the Swing and Tkinter interfaces and ensuring files are stored and retrieved appropriately.
+
+#### 5.1 Enhance Server File Handling
+
+Modify the server to save uploaded files and serve them upon request.
+
+```java
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.nio.file.Files;
+
+public class ChatServiceImpl extends ChatServiceGrpc.ChatServiceImplBase {
+
+    private final ConcurrentLinkedQueue<StreamObserver<Chat.MessageResponse>> messageObservers = new ConcurrentLinkedQueue<>();
+    private final ConcurrentLinkedQueue<StreamObserver<Chat.FileResponse>> fileObservers = new ConcurrentLinkedQueue<>();
+    private final File uploadDir = new File("uploads");
+
+    public ChatServiceImpl() {
+        if (!uploadDir.exists()) {
+            uploadDir.mkdir();
+        }
+    }
+
+    @Override
+    public void sendFile(Chat.FileRequest request, StreamObserver<Chat.FileResponse> responseObserver) {
+        File file = new File(uploadDir, request.getFilename());
+        try (FileOutputStream fos = new FileOutputStream(file)) {
+            fos.write(request.getFile().toByteArray());
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+
+        Chat.FileResponse response = Chat.FileResponse.newBuilder()
+                .setFile(request.getFile())
+                .setFilename(request.getFilename())
+                .setSender("Server")
+                .build();
+
+        for (StreamObserver<Chat.FileResponse> observer : fileObservers) {
+            observer.onNext(response);
+        }
+
+        responseObserver.onNext(response);
+        responseObserver.onCompleted();
+    }
+}
+```
+
+#### 5.2 Enhance Client File Handling
+
+Modify the client to save downloaded files and retrieve them from the server.
+
+```python
+import os
+
+class ChatClient:
+    def __init__(self):
+        self.channel = grpc.insecure_channel('localhost:50051')
+        self.stub = chat_pb2_grpc.ChatServiceStub(self.channel)
+        self.download_dir = "downloads"
+        if not os.path.exists(self.download_dir):
+            os.makedirs(self.download_dir)
+
+    def receive_files(self):
+        for response in self.stub.ReceiveFiles(chat_pb2.Empty()):
+            file_path = os.path.join(self.download_dir, response.filename)
+            with open(file_path, 'wb') as f:
+                f.write(response.file)
+            yield response
+```
+
+### 6. Integrate File Reception in Client and Server Interfaces
+
+Ensure both the Swing and Tkinter interfaces can handle received files appropriately.
+
+#### 6.1 Update the Swing Interface for File Reception
+
+Add a method to handle received files and display a notification in the chat area.
+
+```java
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+
+public class ServerChatWindow extends JFrame {
+
+    // Existing code...
+
+    public ServerChatWindow() {
+        // Existing code...
+
+        Executors.newSingleThreadScheduledExecutor().scheduleAtFixedRate(this::receiveFiles, 0, 1, TimeUnit.SECONDS);
+    }
+
+    private void receiveFiles() {
+        for (Chat.FileResponse response : chatService.receiveFiles(Chat.Empty.newBuilder().build())) {
+            String filePath = "uploads/" + response.getFilename();
+            try (FileOutputStream fos = new FileOutputStream(filePath)) {
+                fos.write(response.getFile().toByteArray());
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+            SwingUtilities.invokeLater(() -> chatArea.append("Received file: " + response.getFilename() + "\n"));
+        }
+    }
+}
+```
+
+#### 6.2 Update the Tkinter Interface for File Reception
+
+Add a method to handle received files and display a notification in the chat area.
+
+```python
+from threading import Thread
+
+class ClientChatWindow:
+    def __init__(self, root):
+        # Existing code...
+
+        self.start_receiving_files()
+
+    def start_receiving_files(self):
+        def receive_files():
+            for response in self.client.receive_files():
+                file_path = os.path.join(self.client.download_dir, response.filename)
+                with open(file_path, 'wb') as f:
+                    f.write(response.file)
+                self.update_chat("Server", f"Received file: {response.filename}")
+
+        Thread(target=receive_files, daemon=True).start()
+```
+
+### 7. Final Integration and Testing
+
+1. **Run the Server**: Start the Spring Boot application.
+2. **Run the Client**: Execute the Python script.
+3. **Test the Application**: Use the chat windows to send messages and files between the client and server.
+
+This completes the setup of a chat application with file transfer capabilities using Tkinter for the client and Swing for the server.
