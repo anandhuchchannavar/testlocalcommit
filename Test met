@@ -266,3 +266,143 @@ logging.level.io.opentelemetry=DEBUG
 ```
 
 This will provide more detailed logs that can help in diagnosing the issue with span export.
+
+
+
+
+
+
+It looks like I provided a conceptual approach, but the actual class and its setup might need more specific implementation. Let's ensure you have the right setup for monitoring gRPC services with Prometheus and Grafana using Micrometer.
+
+### Updated Steps
+
+### Step 1: Add Dependencies
+Make sure you have the necessary dependencies in your `pom.xml`:
+
+```xml
+<dependency>
+    <groupId>io.micrometer</groupId>
+    <artifactId>micrometer-registry-prometheus</artifactId>
+</dependency>
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-actuator</artifactId>
+</dependency>
+<dependency>
+    <groupId>io.grpc</groupId>
+    <artifactId>grpc-netty-shaded</artifactId>
+</dependency>
+<dependency>
+    <groupId>io.grpc</groupId>
+    <artifactId>grpc-protobuf</artifactId>
+</dependency>
+<dependency>
+    <groupId>io.grpc</groupId>
+    <artifactId>grpc-stub</artifactId>
+</dependency>
+```
+
+### Step 2: Implement gRPC Metrics Manually
+
+Micrometer doesn't have built-in support for gRPC metrics, so we need to implement custom metrics for gRPC. Here's an example of how you can create and register gRPC metrics manually:
+
+1. **Define Custom Metrics Configuration:**
+
+```java
+import io.grpc.ServerInterceptor;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Tags;
+import io.micrometer.core.instrument.Timer;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+import java.util.concurrent.TimeUnit;
+
+@Configuration
+public class GrpcMetricsConfiguration {
+
+    @Bean
+    public ServerInterceptor grpcMetricsInterceptor(MeterRegistry meterRegistry) {
+        return (call, headers, next) -> {
+            Timer.Sample sample = Timer.start(meterRegistry);
+            return next.startCall(new ForwardingServerCall.SimpleForwardingServerCall<>(call) {
+                @Override
+                public void close(Status status, Metadata trailers) {
+                    sample.stop(meterRegistry.timer("grpc.server.calls", Tags.of("method", call.getMethodDescriptor().getFullMethodName(), "status", status.getCode().name())));
+                    super.close(status, trailers);
+                }
+            }, headers);
+        };
+    }
+}
+```
+
+2. **Configure gRPC Server to Use the Interceptor:**
+
+```java
+import io.grpc.Server;
+import io.grpc.ServerBuilder;
+import io.grpc.ServerInterceptor;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+@Configuration
+public class GrpcServerConfig {
+
+    @Bean
+    public Server grpcServer(ServerInterceptor grpcMetricsInterceptor, MyGrpcService myGrpcService) {
+        return ServerBuilder.forPort(9090)
+                .addService(ServerInterceptors.intercept(myGrpcService, grpcMetricsInterceptor))
+                .build();
+    }
+}
+```
+
+3. **Define Your gRPC Service Implementation:**
+
+```java
+import io.grpc.stub.StreamObserver;
+
+public class MyGrpcService extends MyServiceGrpc.MyServiceImplBase {
+
+    @Override
+    public void myMethod(MyRequest request, StreamObserver<MyResponse> responseObserver) {
+        // Implement your gRPC method
+        MyResponse response = MyResponse.newBuilder().setMessage("Hello " + request.getName()).build();
+        responseObserver.onNext(response);
+        responseObserver.onCompleted();
+    }
+}
+```
+
+4. **Expose Metrics in Spring Boot:**
+   Ensure that the Prometheus metrics endpoint is exposed as described earlier:
+
+```yaml
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+```
+
+### Step 3: Configure Prometheus
+Add the following configuration to your `prometheus.yml`:
+
+```yaml
+scrape_configs:
+  - job_name: 'spring-boot-app'
+    static_configs:
+      - targets: ['localhost:8080']  # Replace with your Spring Boot app host and port
+```
+
+### Step 4: Setup Grafana
+1. **Install Grafana** if not already done.
+2. **Add Prometheus as a Data Source** in Grafana as described earlier.
+3. **Create Grafana Dashboards** using Prometheus queries to visualize gRPC metrics.
+
+By following these steps, you should be able to set up custom gRPC metrics in a Spring Boot application and monitor them using Prometheus and Grafana.
