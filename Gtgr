@@ -48,3 +48,91 @@ public class GrpcLoadTest extends Simulation {
         });
     }
 }
+
+
+
+package com.example;
+
+import io.gatling.javaapi.core.Action;
+import io.gatling.javaapi.core.Session;
+import io.gatling.javaapi.core.structure.ScenarioBuilder;
+import io.gatling.javaapi.core.action.builder.ActionBuilder;
+import io.gatling.javaapi.http.HttpDsl;
+import io.grpc.ManagedChannel;
+import io.grpc.ManagedChannelBuilder;
+import io.grpc.stub.StreamObserver;
+import greeting.GreetingServiceGrpc;
+import greeting.GreetingServiceOuterClass;
+
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.TimeUnit;
+
+import static io.gatling.javaapi.core.CoreDsl.*;
+
+public class GrpcAction implements ActionBuilder {
+
+    private final String host;
+    private final int port;
+    private final ManagedChannel channel;
+    private final GreetingServiceGrpc.GreetingServiceBlockingStub blockingStub;
+
+    public GrpcAction(String host, int port) {
+        this.host = host;
+        this.port = port;
+        this.channel = ManagedChannelBuilder.forAddress(host, port)
+                .usePlaintext()
+                .build();
+        this.blockingStub = GreetingServiceGrpc.newBlockingStub(channel);
+    }
+
+    @Override
+    public Action build() {
+        return new io.gatling.core.action.Action() {
+            @Override
+            public void execute(Session session) {
+                GreetingServiceOuterClass.GreetingRequest request = GreetingServiceOuterClass.GreetingRequest.newBuilder()
+                        .setName("Gatling")
+                        .build();
+                GreetingServiceOuterClass.GreetingResponse response = blockingStub.greet(request);
+                session.set("response", response);
+
+                next().execute(session);
+            }
+
+            @Override
+            public String name() {
+                return "GrpcAction";
+            }
+        };
+    }
+}Create the Gatling Simulation Script in JavaNow, create the GrpcLoadTest.java file in src/test/java/com/example directory and use the custom action.package com.example;
+
+import io.gatling.javaapi.core.CoreDsl;
+import io.gatling.javaapi.core.ScenarioBuilder;
+import io.gatling.javaapi.core.Simulation;
+import io.gatling.javaapi.http.HttpDsl;
+
+import static io.gatling.javaapi.core.CoreDsl.*;
+
+public class GrpcLoadTest extends Simulation {
+
+    private final String host = "localhost";
+    private final int port = 9090;
+
+    private final GrpcAction grpcAction = new GrpcAction(host, port);
+
+    private final ScenarioBuilder scn = scenario("gRPC Load Test")
+            .exec(grpcAction)
+            .exec(session -> {
+                // Process the response if needed
+                Object response = session.get("response");
+                System.out.println("Received response: " + response);
+                return session;
+            });
+
+    {
+        setUp(
+                scn.injectOpen(atOnceUsers(100)) // Adjust user count as needed
+        );
+    }
+}
