@@ -1,0 +1,50 @@
+import io.gatling.javaapi.core.*;
+import io.gatling.javaapi.http.*;
+import io.grpc.ManagedChannel;
+import io.grpc.ManagedChannelBuilder;
+import io.grpc.stub.StreamObserver;
+import greeting.GreetingServiceGrpc;
+import greeting.GreetingServiceOuterClass;
+
+import java.util.concurrent.TimeUnit;
+
+import static io.gatling.javaapi.core.CoreDsl.*;
+import static io.gatling.javaapi.http.HttpDsl.*;
+
+public class GrpcLoadTest extends Simulation {
+
+    private final String host = "localhost";
+    private final int port = 9090;
+    private final ManagedChannel channel = ManagedChannelBuilder.forAddress(host, port)
+            .usePlaintext()
+            .build();
+    private final GreetingServiceGrpc.GreetingServiceBlockingStub blockingStub = GreetingServiceGrpc.newBlockingStub(channel);
+
+    private final ScenarioBuilder scn = scenario("gRPC Load Test")
+            .exec(session -> {
+                GreetingServiceOuterClass.GreetingRequest request = GreetingServiceOuterClass.GreetingRequest.newBuilder()
+                        .setName("Gatling")
+                        .build();
+                GreetingServiceOuterClass.GreetingResponse response = blockingStub.greet(request);
+                return session.set("response", response);
+            });
+
+    {
+        setUp(
+                scn.injectOpen(atOnceUsers(100)) // Adjust user count as needed
+        ).protocols(
+                http.baseUrl("http://" + host + ":" + port)
+        );
+
+        after(() -> {
+            channel.shutdown();
+            try {
+                if (!channel.awaitTermination(5, TimeUnit.SECONDS)) {
+                    System.err.println("Channel did not terminate");
+                }
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
+        });
+    }
+}
