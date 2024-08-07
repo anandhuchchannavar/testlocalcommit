@@ -57,3 +57,49 @@ public class BookSaveSimulation extends Simulation {
             .during(Duration.ofSeconds(rampUptimeSeconds + duration));
     }
 }
+
+
+
+
+
+
+
+package gatling;
+
+import io.gatling.javaapi.core.CoreDsl;
+import io.gatling.javaapi.core.Predef;
+import io.gatling.javaapi.core.ScenarioBuilder;
+import io.gatling.javaapi.grpc.GrpcDsl;
+import io.gatling.javaapi.grpc.GrpcProtocolBuilder;
+
+import static io.gatling.javaapi.core.CoreDsl.*;
+import static io.gatling.javaapi.grpc.GrpcDsl.*;
+
+public class HelloServiceSimulation extends Simulation {
+
+    // Define the gRPC protocol configuration
+    private static final GrpcProtocolBuilder grpcProtocol = grpc
+        .protocolBuilder()
+        .withHost("localhost")
+        .withPort(50051) // Port for your gRPC server
+        .build();
+
+    // Define the scenario
+    private static final ScenarioBuilder scn = scenario("HelloServiceScenario")
+        .exec(
+            grpc("SayHello")
+                .unary("HelloService/SayHello")
+                .payload(HelloRequest.newBuilder().setName("Gatling").build())
+                .check(
+                    grpc("response")
+                        .check("message", CoreDsl.is("Hello Gatling"))
+                )
+        );
+
+    {
+        setUp(
+            scn.inject(atOnceUsers(1))
+        ).protocols(grpcProtocol);
+    }
+}
+
