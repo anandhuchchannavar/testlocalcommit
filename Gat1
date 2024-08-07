@@ -1,0 +1,59 @@
+import io.gatling.javaapi.core.*;
+import io.gatling.javaapi.grpc.*;
+import io.grpc.ManagedChannel;
+import io.grpc.ManagedChannelBuilder;
+import com.github.javafaker.Faker;
+import java.util.*;
+import java.util.stream.Stream;
+import static io.gatling.javaapi.core.CoreDsl.*;
+import static io.gatling.javaapi.grpc.GrpcDsl.*;
+
+public class BookSaveSimulation extends Simulation {
+
+    private final GrpcProtocolBuilder grpcProtocol = grpc()
+            .warmUp("http://localhost:8080")
+            .channel(
+                ManagedChannelBuilder.forAddress("localhost", 6565)
+                    .usePlaintext()
+                    .build()
+            );
+
+    private final ScenarioBuilder scn = scenario("gRPC Load Test")
+            .feed(feedData())
+            .exec(
+                grpc("create-book")
+                    .rpc("/your.grpc.BookService/CreateBook")
+                    .payload(session -> {
+                        // Replace with your actual gRPC request builder
+                        return BookRequest.newBuilder()
+                                .setTitle(session.getString("title"))
+                                .build();
+                    })
+                    .check(status().isOk())
+            );
+
+    public BookSaveSimulation() {
+        setUp(scn.injectOpen(injection()).protocols(grpcProtocol))
+            .assertions(global().responseTime().max().lte(10000),
+                        global().successfulRequests().percent().gt(90d));
+    }
+
+    private static Iterator<Map<String, Object>> feedData() {
+        Faker faker = new Faker();
+        return Stream.generate(() -> {
+            Map<String, Object> stringObjectMap = new HashMap<>();
+            stringObjectMap.put("title", faker.book().title());
+            return stringObjectMap;
+        }).iterator();
+    }
+
+    private RampRateOpenInjectionStep injection() {
+        int totalUsers = 100;
+        double userRampUpPerInterval = 10;
+        double rampUpIntervalInSeconds = 30;
+        int rampUptimeSeconds = 300;
+        int duration = 300;
+        return rampUsersPerSec(userRampUpPerInterval / (rampUpIntervalInSeconds)).to(totalUsers)
+            .during(Duration.ofSeconds(rampUptimeSeconds + duration));
+    }
+}
