@@ -1,0 +1,150 @@
+To call and execute a stored procedure using the jakarta.persistence.StoredProcedureQuery API in a standalone Java program, you need to set up a JPA environment. Here's a step-by-step guide:
+
+
+---
+
+Setup
+
+1. Dependencies: Add the required dependencies to your project.
+
+For Maven:
+
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-data-jpa</artifactId>
+</dependency>
+<dependency>
+    <groupId>com.oracle.database.jdbc</groupId>
+    <artifactId>ojdbc8</artifactId>
+    <scope>runtime</scope>
+</dependency>
+
+
+2. Create Persistence Configuration: In a standalone program, you need a persistence.xml file in the META-INF directory.
+
+persistence.xml:
+
+<persistence xmlns="https://jakarta.ee/xml/ns/persistence" version="3.0">
+    <persistence-unit name="default">
+        <class>com.example.YourEntity</class>
+        <properties>
+            <property name="jakarta.persistence.jdbc.url" value="jdbc:oracle:thin:@//your-db-host:1521/your-db-service" />
+            <property name="jakarta.persistence.jdbc.user" value="your-username" />
+            <property name="jakarta.persistence.jdbc.password" value="your-password" />
+            <property name="jakarta.persistence.jdbc.driver" value="oracle.jdbc.OracleDriver" />
+            <property name="hibernate.dialect" value="org.hibernate.dialect.OracleDialect" />
+            <property name="hibernate.show_sql" value="true" />
+        </properties>
+    </persistence-unit>
+</persistence>
+
+
+
+
+---
+
+Java Program
+
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.EntityManagerFactory;
+import jakarta.persistence.Persistence;
+import jakarta.persistence.StoredProcedureQuery;
+
+public class StoredProcExecutor {
+
+    public static void main(String[] args) {
+        // Create EntityManagerFactory
+        EntityManagerFactory emf = Persistence.createEntityManagerFactory("default");
+        EntityManager em = emf.createEntityManager();
+
+        try {
+            // Define the stored procedure query
+            StoredProcedureQuery spQuery = em.createStoredProcedureQuery("your_procedure_name");
+
+            // Set input parameters
+            spQuery.registerStoredProcedureParameter("input1", Integer.class, jakarta.persistence.ParameterMode.IN);
+            spQuery.registerStoredProcedureParameter("input2", String.class, jakarta.persistence.ParameterMode.IN);
+
+            // Set output parameters
+            spQuery.registerStoredProcedureParameter("output1", String.class, jakarta.persistence.ParameterMode.OUT);
+
+            // Provide values for input parameters
+            spQuery.setParameter("input1", 123);
+            spQuery.setParameter("input2", "Example Input");
+
+            // Execute the stored procedure
+            spQuery.execute();
+
+            // Retrieve output parameter
+            String output = (String) spQuery.getOutputParameterValue("output1");
+            System.out.println("Output from stored procedure: " + output);
+
+        } catch (Exception e) {
+            e.printStackTrace();
+        } finally {
+            em.close();
+            emf.close();
+        }
+    }
+}
+
+
+---
+
+Stored Procedure Example
+
+Assume the stored procedure in Oracle is:
+
+CREATE OR REPLACE PROCEDURE your_procedure_name (
+    input1 IN NUMBER,
+    input2 IN VARCHAR2,
+    output1 OUT VARCHAR2
+) AS
+BEGIN
+    output1 := 'Received: ' || input1 || ', ' || input2;
+END;
+
+
+---
+
+Explanation
+
+1. EntityManagerFactory and EntityManager:
+
+EntityManagerFactory is created using the Persistence class with the persistence unit name defined in persistence.xml.
+
+EntityManager is used to interact with the database.
+
+
+
+2. StoredProcedureQuery:
+
+Use createStoredProcedureQuery("procedure_name") to define a stored procedure call.
+
+Register input and output parameters using registerStoredProcedureParameter.
+
+
+
+3. Execute and Retrieve Results:
+
+Call execute() to run the procedure.
+
+Use getOutputParameterValue to fetch the output parameter values.
+
+
+
+
+
+---
+
+Output
+
+Running the program will print:
+
+Output from stored procedure: Received: 123, Example Input
+
+
+---
+
+Let me know if you need further clarification or additional examples!
+
