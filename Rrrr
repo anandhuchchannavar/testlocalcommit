@@ -1,0 +1,9 @@
+function extractValue(str) {
+    const match = str.match(/(.*?)/);
+    return match ? match[1] : str;
+}
+
+// Test cases
+console.log(extractValue("Is one of (R,N,P)")); // Output: "R,N,P"
+console.log(extractValue("Is one of R,N,P"));   // Output: "Is one of R,N,P"
+console.log(extractValue("xyz"));              // Output: "xyz"
