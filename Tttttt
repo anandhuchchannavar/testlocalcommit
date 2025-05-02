@@ -1,0 +1,44 @@
+If you want your logback-test.xml to capture logs from multiple classes (e.g., BatchMain, BatchService, etc.), you can simply define multiple <logger> entries, one per class or package.
+
+Example: logback-test.xml for Multiple Classes
+
+<configuration>
+
+    <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <!-- Log specifically from BatchMain -->
+    <logger name="com.example.BatchMain" level="DEBUG" additivity="false">
+        <appender-ref ref="STDOUT" />
+    </logger>
+
+    <!-- Log from BatchService -->
+    <logger name="com.example.service.BatchService" level="DEBUG" additivity="false">
+        <appender-ref ref="STDOUT" />
+    </logger>
+
+    <!-- Or log from entire package -->
+    <logger name="com.example" level="DEBUG" additivity="false">
+        <appender-ref ref="STDOUT" />
+    </logger>
+
+    <!-- Root logger (fallback for all other loggers) -->
+    <root level="ERROR">
+        <appender-ref ref="STDOUT"/>
+    </root>
+</configuration>
+
+Notes:
+
+Use fully qualified class names in the name attribute of <logger>.
+
+additivity="false" prevents messages from also being sent to parent loggers.
+
+You can include com.example or any base package to capture all related logs in one go.
+
+
+Would you like a version that writes logs to a file for easier assertion in tests?
+
