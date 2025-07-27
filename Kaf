@@ -1,0 +1,31 @@
+@echo off
+SETLOCAL
+
+REM === Configuration ===
+SET KAFKA_DIR=C:\kafka
+SET TOPIC_NAME=test-topic
+SET PARTITIONS=1
+SET REPLICATION=1
+
+REM === Start Zookeeper ===
+echo Starting Zookeeper...
+start "" cmd /k "%KAFKA_DIR%\bin\windows\zookeeper-server-start.bat %KAFKA_DIR%\config\zookeeper.properties"
+echo Waiting for Zookeeper to start...
+timeout /t 10 /nobreak >nul
+
+REM === Start Kafka Broker ===
+echo Starting Kafka Broker...
+start "" cmd /k "%KAFKA_DIR%\bin\windows\kafka-server-start.bat %KAFKA_DIR%\config\server.properties"
+echo Waiting for Kafka to start...
+timeout /t 10 /nobreak >nul
+
+REM === Create Kafka Topic ===
+echo Creating topic: %TOPIC_NAME%
+%KAFKA_DIR%\bin\windows\kafka-topics.bat --create --topic %TOPIC_NAME% --bootstrap-server localhost:9092 --partitions %PARTITIONS% --replication-factor %REPLICATION%
+
+echo.
+echo ✅ Kafka environment is up and topic '%TOPIC_NAME%' created.
+echo.
+
+pause
+ENDLOCAL
