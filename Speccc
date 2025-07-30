@@ -1,0 +1,106 @@
+const { test, expect } = require('@playwright/test');
+const fs = require('fs');
+const path = require('path');
+const axios = require('axios');
+
+// Declare URLs here
+const oldUrl = 'https://old-service.example.com/endpoint';
+const newUrl = 'https://new-service.example.com/endpoint';
+
+const requestsDir = path.join(__dirname, 'requests');
+const resultsDir = path.join(__dirname, 'test-results');
+
+// Create results folder if not exists
+if (!fs.existsSync(resultsDir)) fs.mkdirSync(resultsDir);
+
+// Keys to ignore while comparing
+const ignoredKeys = ['timestamp', 'id', 'uuid']; // customize as needed
+
+// Recursively collect JSON files from subfolders
+function getAllJsonFiles(dir) {
+  let results = [];
+  const list = fs.readdirSync(dir);
+  list.forEach(file => {
+    const filePath = path.join(dir, file);
+    const stat = fs.statSync(filePath);
+    if (stat.isDirectory()) {
+      results = results.concat(getAllJsonFiles(filePath));
+    } else if (file.endsWith('.json')) {
+      results.push(filePath);
+    }
+  });
+  return results;
+}
+
+// Deep remove ignored keys from nested objects
+function removeKeysDeep(obj, keysToIgnore) {
+  if (Array.isArray(obj)) {
+    return obj.map(item => removeKeysDeep(item, keysToIgnore));
+  } else if (typeof obj === 'object' && obj !== null) {
+    return Object.entries(obj).reduce((acc, [key, value]) => {
+      if (!keysToIgnore.includes(key)) {
+        acc[key] = removeKeysDeep(value, keysToIgnore);
+      }
+      return acc;
+    }, {});
+  }
+  return obj;
+}
+
+// Show differences in two objects
+function getDiff(a, b) {
+  const diffs = [];
+  function compare(x, y, path = '') {
+    if (typeof x !== typeof y) {
+      diffs.push(`Type mismatch at ${path}: ${typeof x} vs ${typeof y}`);
+    } else if (typeof x === 'object' && x !== null && y !== null) {
+      const keys = new Set([...Object.keys(x), ...Object.keys(y)]);
+      keys.forEach(k => compare(x[k], y[k], path ? `${path}.${k}` : k));
+    } else if (x !== y) {
+      diffs.push(`Value mismatch at ${path}: ${JSON.stringify(x)} vs ${JSON.stringify(y)}`);
+    }
+  }
+  compare(a, b);
+  return diffs;
+}
+
+const requestFiles = getAllJsonFiles(requestsDir);
+
+// Generate one test per request file
+for (const filePath of requestFiles) {
+  const relativePath = path.relative(requestsDir, filePath);
+  const testName = relativePath.replace(/[\\/]/g, '_').replace(/\.json$/, '');
+
+  test(`Compare responses for ${relativePath}`, async () => {
+    const requestBody = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+
+    let oldResponse, newResponse;
+
+    try {
+      [oldResponse, newResponse] = await Promise.all([
+        axios.post(oldUrl, requestBody),
+        axios.post(newUrl, requestBody),
+      ]);
+    } catch (err) {
+      throw new Error(`Failed API call: ${err.message}`);
+    }
+
+    // Save raw responses
+    const safeBase = testName;
+    fs.writeFileSync(path.join(resultsDir, `${safeBase}_old.json`), JSON.stringify(oldResponse.data, null, 2));
+    fs.writeFileSync(path.join(resultsDir, `${safeBase}_new.json`), JSON.stringify(newResponse.data, null, 2));
+
+    // Clean up ignored keys
+    const cleanedOld = removeKeysDeep(oldResponse.data, ignoredKeys);
+    const cleanedNew = removeKeysDeep(newResponse.data, ignoredKeys);
+
+    // Compare
+    const diffs = getDiff(cleanedOld, cleanedNew);
+
+    if (diffs.length > 0) {
+      console.log(`\n❌ Differences found for ${relativePath}:\n` + diffs.join('\n'));
+    }
+
+    expect(diffs).toEqual([]);
+  });
+}
