@@ -1,0 +1,31 @@
+if (diffs.length > 0) {
+  console.log(`\n❌ Differences found in ${relativePath}:\n` + diffs.join('\n'));
+
+  // Generate HTML diff
+  const htmlDiff = `
+    <html><head><style>
+      body { font-family: monospace; }
+      .diff { display: flex; gap: 2em; }
+      .block { width: 50%; white-space: pre-wrap; background: #f9f9f9; padding: 1em; border: 1px solid #ccc; }
+      .mismatch { background-color: #ffecec; }
+    </style></head><body>
+      <h2>Difference for ${relativePath}</h2>
+      <div class="diff">
+        <div class="block"><strong>Old Response</strong>\n${JSON.stringify(cleanedOld, null, 2)}</div>
+        <div class="block"><strong>New Response</strong>\n${JSON.stringify(cleanedNew, null, 2)}</div>
+      </div>
+      <h3>Mismatched Fields</h3>
+      <pre>${diffs.join('\n')}</pre>
+    </body></html>
+  `;
+
+  const diffFilePath = path.join(resultsDir, `${safeBase}_diff.html`);
+  fs.writeFileSync(diffFilePath, htmlDiff);
+
+  // Attach to Playwright report
+  test.info().attachments.push({
+    name: 'response-diff',
+    path: diffFilePath,
+    contentType: 'text/html',
+  });
+}
