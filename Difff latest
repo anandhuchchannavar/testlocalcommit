@@ -1,0 +1,58 @@
+const { diffWords } = require('diff'); // Make sure this is at the top
+
+if (diffs.length > 0) {
+  console.log(`\n❌ Differences found in ${relativePath}:\n` + diffs.join('\n'));
+
+  // Generate highlighted mismatched fields
+  const highlightedDiffsHtml = diffs.map(line => {
+    const match = line.match(/Key: (.*?) - Old: (.*?) - New: (.*)/);
+    if (!match) return `<pre>${line}</pre>`;
+
+    const key = match[1];
+    const oldVal = match[2];
+    const newVal = match[3];
+
+    const diffHtml = diffWords(oldVal, newVal).map(part => {
+      const color = part.added ? 'lightgreen' :
+                    part.removed ? 'salmon' : 'transparent';
+      return `<span style="background-color:${color}">${part.value}</span>`;
+    }).join('');
+
+    return `
+      <div style="margin-bottom: 1em;">
+        <strong>Key:</strong> ${key}<br/>
+        <strong>Old:</strong> <code>${oldVal}</code><br/>
+        <strong>New:</strong> <code>${diffHtml}</code>
+      </div>
+    `;
+  }).join('\n');
+
+  // Generate HTML diff
+  const htmlDiff = `
+    <html><head><style>
+      body { font-family: monospace; }
+      .diff { display: flex; gap: 2em; }
+      .block { width: 50%; white-space: pre-wrap; background: #f9f9f9; padding: 1em; border: 1px solid #ccc; }
+      .mismatch { background-color: #ffecec; }
+      code { background-color: #f0f0f0; padding: 2px 4px; }
+    </style></head><body>
+      <h2>Difference for ${relativePath}</h2>
+      <div class="diff">
+        <div class="block"><strong>Old Response</strong>\n${JSON.stringify(cleanedOld, null, 2)}</div>
+        <div class="block"><strong>New Response</strong>\n${JSON.stringify(cleanedNew, null, 2)}</div>
+      </div>
+      <h3>Mismatched Fields</h3>
+      ${highlightedDiffsHtml}
+    </body></html>
+  `;
+
+  const diffFilePath = path.join(resultsDir, `${safeBase}_diff.html`);
+  fs.writeFileSync(diffFilePath, htmlDiff);
+
+  // Attach to Playwright report
+  test.info().attachments.push({
+    name: 'response-diff',
+    path: diffFilePath,
+    contentType: 'text/html',
+  });
+}
