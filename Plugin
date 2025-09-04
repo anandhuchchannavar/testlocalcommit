@@ -1,0 +1,702 @@
+Awesome — here’s a ready-to-drop-in Maven plugin that runs CodeLlama-7B (via Ollama), gathers line-level comments, and emits a single interactive HTML report with:
+
+Collapsible project tree
+
+Inline comment bubbles + tooltips
+
+Severity colors (INFO/WARNING/ERROR)
+
+Sidebar search (filters files/directories live)
+
+Download PDF button (uses the browser’s print-to-PDF)
+
+Works fully offline (no external CDNs)
+
+
+Below are the key files. You can keep this as a standalone Maven module (packaging maven-plugin) and use it in any repo.
+
+
+---
+
+1) pom.xml (plugin module)
+
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.example</groupId>
+  <artifactId>code-review-plugin</artifactId>
+  <version>1.0.0</version>
+  <packaging>maven-plugin</packaging>
+
+  <properties>
+    <java.version>17</java.version>
+  </properties>
+
+  <dependencies>
+    <!-- JSON -->
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+      <version>2.17.2</version>
+    </dependency>
+    <!-- For simple HTTP to Ollama -->
+    <dependency>
+      <groupId>org.apache.httpcomponents.client5</groupId>
+      <artifactId>httpclient5</artifactId>
+      <version>5.3.1</version>
+    </dependency>
+    <!-- Optional: globbing utils -->
+    <dependency>
+      <groupId>org.codehaus.plexus</groupId>
+      <artifactId>plexus-utils</artifactId>
+      <version>4.0.1</version>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-plugin-plugin</artifactId>
+        <version>3.10.2</version>
+        <configuration>
+          <goalPrefix>codereview</goalPrefix>
+        </configuration>
+        <executions>
+          <execution>
+            <goals>
+              <goal>descriptor</goal>
+            </goals>
+          </execution>
+        </executions>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.13.0</version>
+        <configuration>
+          <source>17</source>
+          <target>17</target>
+          <release>17</release>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</project>
+
+
+---
+
+2) Mojo: CodeReviewMojo.java
+
+package com.example.codereview;
+
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.maven.plugin.AbstractMojo;
+import org.apache.maven.plugin.MojoExecutionException;
+import org.apache.maven.plugins.annotations.*;
+
+import java.io.*;
+import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
+import java.util.*;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+
+@Mojo(name = "analyze", defaultPhase = LifecyclePhase.VERIFY, threadSafe = true)
+public class CodeReviewMojo extends AbstractMojo {
+
+    @Parameter(defaultValue = "${project.basedir}", readonly = true, required = true)
+    private File baseDir;
+
+    @Parameter(property = "codereview.sourceIncludes", defaultValue = "src/main/java/**,src/test/java/**")
+    private String sourceIncludes; // comma-separated globs
+
+    @Parameter(property = "codereview.sourceExcludes", defaultValue = "target/**,**/generated/**,**/build/**")
+    private String sourceExcludes;
+
+    @Parameter(property = "codereview.maxFileBytes", defaultValue = "120000")
+    private int maxFileBytes;
+
+    @Parameter(property = "codereview.ollamaUrl", defaultValue = "http://localhost:11434")
+    private String ollamaUrl;
+
+    @Parameter(property = "codereview.model", defaultValue = "codellama:7b")
+    private String model;
+
+    @Parameter(property = "codereview.temperature", defaultValue = "0.1")
+    private double temperature;
+
+    @Parameter(property = "codereview.parallel", defaultValue = "2")
+    private int parallel; // number of files processed concurrently
+
+    @Parameter(property = "codereview.outputFile", defaultValue = "${project.build.directory}/code-review-report.html")
+    private File outputFile;
+
+    @Parameter(property = "codereview.failOnError", defaultValue = "false")
+    private boolean failOnError; // optionally fail build if ERROR comments found
+
+    private final ObjectMapper mapper = new ObjectMapper();
+
+    @Override
+    public void execute() throws MojoExecutionException {
+        try {
+            var includeGlobs = splitCsv(sourceIncludes);
+            var excludeGlobs = splitCsv(sourceExcludes);
+
+            List<Path> files = scanSources(baseDir.toPath(), includeGlobs, excludeGlobs);
+            if (files.isEmpty()) {
+                getLog().warn("No source files matched includes/excludes.");
+            }
+
+            // Build reviewData structure: Map<path, {code: List<String>, comments: List<...>}>
+            Map<String, Object> reviewData = new LinkedHashMap<>();
+            var client = new OllamaClient(ollamaUrl, model, temperature, getLog());
+
+            var pool = java.util.concurrent.Executors.newFixedThreadPool(Math.max(1, parallel));
+            List<java.util.concurrent.Future<?>> futures = new ArrayList<>();
+
+            for (Path file : files) {
+                futures.add(pool.submit(() -> {
+                    try {
+                        byte[] bytes = Files.readAllBytes(file);
+                        if (bytes.length > maxFileBytes) {
+                            getLog().info("Skipping large file: " + baseDir.toPath().relativize(file) + " (" + bytes.length + " bytes)");
+                            return;
+                        }
+                        String code = new String(bytes, StandardCharsets.UTF_8);
+                        List<String> lines = codeLines(code);
+                        List<ReviewComment> comments = requestReview(client, file, code);
+
+                        synchronized (reviewData) {
+                            reviewData.put(unixPath(baseDir.toPath().relativize(file).toString()),
+                                    Map.of("code", lines, "comments", comments));
+                        }
+                    } catch (Exception e) {
+                        getLog().error("Failed to review file " + file + ": " + e.getMessage(), e);
+                    }
+                }));
+            }
+            for (var f : futures) f.get();
+            pool.shutdown();
+
+            // Generate HTML with embedded JSON
+            String html = HtmlReportGenerator.generate(reviewData);
+            outputFile.getParentFile().mkdirs();
+            Files.writeString(outputFile.toPath(), html, StandardCharsets.UTF_8);
+
+            getLog().info("Code review report generated: " + outputFile.getAbsolutePath());
+
+            if (failOnError && containsSeverity(reviewData, "ERROR")) {
+                throw new MojoExecutionException("Code review found ERROR-level comments.");
+            }
+        } catch (MojoExecutionException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new MojoExecutionException("Code review failed", e);
+        }
+    }
+
+    private static boolean containsSeverity(Map<String, Object> reviewData, String sev) {
+        for (Object v : reviewData.values()) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> file = (Map<String, Object>) v;
+            @SuppressWarnings("unchecked")
+            List<Map<String, Object>> comments = (List<Map<String, Object>>) file.get("comments");
+            if (comments != null) {
+                for (var c : comments) {
+                    if (sev.equals(c.get("severity"))) return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private List<ReviewComment> requestReview(OllamaClient client, Path file, String code) throws IOException {
+        String prompt = ReviewPrompt.forJavaFile(file.getFileName().toString(), code);
+        String raw = client.generate(prompt);
+
+        // Expect strict JSON array. If model adds prose, try to extract JSON via a lenient regex.
+        String json = JsonExtractor.extractJsonArray(raw);
+        if (json == null) {
+            getLog().warn("LLM returned non-JSON for " + file + ". Skipping comments.");
+            return List.of();
+        }
+        try {
+            return mapper.readValue(json, new TypeReference<List<ReviewComment>>() {});
+        } catch (Exception e) {
+            getLog().warn("Failed to parse LLM JSON for " + file + ": " + e.getMessage());
+            return List.of();
+        }
+    }
+
+    private static List<String> codeLines(String code) {
+        // normalize to Unix newlines, keep exact text for display
+        return Arrays.asList(code.replace("\r\n", "\n").replace("\r", "\n").split("\n", -1));
+    }
+
+    private static List<Path> scanSources(Path base, List<String> includes, List<String> excludes) throws IOException {
+        var matcherIncludes = includes.stream().map(g -> base.getFileSystem().getPathMatcher("glob:" + g)).toList();
+        var matcherExcludes = excludes.stream().map(g -> base.getFileSystem().getPathMatcher("glob:" + g)).toList();
+
+        try (var s = Files.walk(base)) {
+            return s.filter(Files::isRegularFile)
+                    .filter(p -> matcherIncludes.stream().anyMatch(m -> m.matches(base.relativize(p))))
+                    .filter(p -> matcherExcludes.stream().noneMatch(m -> m.matches(base.relativize(p))))
+                    .filter(p -> {
+                        String n = p.getFileName().toString();
+                        return n.endsWith(".java") || n.endsWith(".kt") || n.endsWith(".xml") || n.endsWith(".properties") || n.endsWith(".yml") || n.endsWith(".yaml") || n.endsWith(".md");
+                    })
+                    .sorted()
+                    .collect(Collectors.toList());
+        }
+    }
+
+    private static List<String> splitCsv(String csv) {
+        if (csv == null || csv.isBlank()) return List.of();
+        return Arrays.stream(csv.split(",")).map(String::trim).filter(s -> !s.isBlank()).toList();
+    }
+
+    private static String unixPath(String p) { return p.replace('\\', '/'); }
+
+    // --- Data records ---
+
+    public static class ReviewComment {
+        public int line;             // 1-based
+        public String severity;      // INFO|WARNING|ERROR
+        public String comment;
+
+        public ReviewComment() {}
+        public ReviewComment(int line, String severity, String comment) {
+            this.line = line; this.severity = severity; this.comment = comment;
+        }
+    }
+
+    // --- Prompt helper ---
+
+    static final class ReviewPrompt {
+        static String forJavaFile(String filename, String code) {
+            return """
+                    You are a strict code reviewer. Review the file: %s.
+                    Return ONLY a JSON array, no preface or postface.
+                    Each element: {"line": <1-based line number>, "severity": "INFO|WARNING|ERROR", "comment": "human-readable suggestion"}.
+                    Rules:
+                    - Use 1-based line numbers.
+                    - Prefer small, actionable comments.
+                    - Keep comments under 220 characters.
+                    - If no issues, return [].
+
+                    Code:
+                    ---
+                    %s
+                    ---
+                    """.formatted(filename, code);
+        }
+    }
+
+    // --- Ollama client ---
+
+    static final class OllamaClient {
+        private final String baseUrl;
+        private final String model;
+        private final double temperature;
+        private final org.apache.maven.plugin.logging.Log log;
+
+        OllamaClient(String baseUrl, String model, double temperature, org.apache.maven.plugin.logging.Log log) {
+            this.baseUrl = baseUrl.endsWith("/") ? baseUrl.substring(0, baseUrl.length()-1) : baseUrl;
+            this.model = model;
+            this.temperature = temperature;
+            this.log = log;
+        }
+
+        String generate(String prompt) throws IOException {
+            // Use /api/generate with stream=false for a single JSON response
+            var payload = """
+              {"model":"%s","prompt":%s,"stream":false,"options":{"temperature":%s}}
+            """.formatted(model, jsonEscape(prompt), Double.toString(temperature));
+
+            var req = org.apache.hc.client5.http.fluent.Request
+                    .post(this.baseUrl + "/api/generate")
+                    .bodyString(payload, org.apache.hc.core5.http.ContentType.APPLICATION_JSON)
+                    .connectTimeout(30_000)
+                    .responseTimeout(120_000);
+
+            String body = req.execute().returnContent().asString(StandardCharsets.UTF_8);
+            // Ollama returns: {"model":"...","created_at":"...","response":"...","done":true,...}
+            String response = JsonExtractor.field(body, "response");
+            if (response == null) {
+                log.warn("Ollama returned no 'response' field; raw: " + body);
+                return body;
+            }
+            return response;
+        }
+
+        private static String jsonEscape(String s) {
+            return "\"" + s
+                    .replace("\\", "\\\\")
+                    .replace("\"", "\\\"")
+                    .replace("\r", "\\r")
+                    .replace("\n", "\\n") + "\"";
+        }
+    }
+
+    // --- JSON helpers ---
+
+    static final class JsonExtractor {
+        private static final Pattern ARRAY = Pattern.compile("\\[\\s*\\{[\\s\\S]*}]");
+        private static final Pattern FIELD_RESPONSE = Pattern.compile("\"response\"\\s*:\\s*\"([\\s\\S]*?)\"");
+
+        static String extractJsonArray(String s) {
+            var m = ARRAY.matcher(s.trim());
+            return m.find() ? m.group() : null;
+        }
+
+        static String field(String json, String field) {
+            if ("response".equals(field)) {
+                var m = FIELD_RESPONSE.matcher(json);
+                if (m.find()) return unescape(m.group(1));
+            }
+            return null;
+        }
+
+        private static String unescape(String s) {
+            return s.replace("\\n", "\n")
+                    .replace("\\r", "\r")
+                    .replace("\\t", "\t")
+                    .replace("\\\"", "\"")
+                    .replace("\\\\", "\\");
+        }
+    }
+}
+
+
+---
+
+3) HTML generator: HtmlReportGenerator.java
+
+package com.example.codereview;
+
+import java.util.*;
+import java.util.stream.Collectors;
+
+public final class HtmlReportGenerator {
+
+    private HtmlReportGenerator() {}
+
+    @SuppressWarnings("unchecked")
+    public static String generate(Map<String, Object> reviewData) {
+        // Embed JSON as <script type="application/json" id="review-data"> ... </script>
+        String json = toJson(reviewData);
+
+        return """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Code Review Report</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<style>
+  :root {
+    --bg: #0b0f14;
+    --panel: #121821;
+    --muted: #9aa4b2;
+    --text: #e8edf3;
+    --border: #263143;
+    --info: #388bfd;
+    --warn: #f5a524;
+    --error: #ef4444;
+    --highlight: #1f2a3a;
+    --chip: #1a2230;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; height: 100vh; display: grid; grid-template-columns: 320px 1fr; }
+  header { grid-column: 1 / span 2; padding: 10px 14px; border-bottom: 1px solid var(--border); background: var(--panel); display: flex; align-items: center; gap: 12px; }
+  header h1 { font-size: 16px; margin: 0; letter-spacing: .3px; }
+  header .chips { margin-left: auto; display: flex; gap: 8px; }
+  .chip { background: var(--chip); border: 1px solid var(--border); padding: 3px 8px; border-radius: 999px; font-size: 12px; }
+  .btn { background: transparent; border: 1px solid var(--border); color: var(--text); padding: 6px 10px; border-radius: 8px; cursor: pointer; }
+  .btn:hover { background: #1a2433; }
+  .sidebar { border-right: 1px solid var(--border); overflow: auto; background: var(--panel); padding: 12px; }
+  .search { width: 100%; margin-bottom: 10px; }
+  .search input { width: 100%; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--border); background: #0f1520; color: var(--text); }
+  .tree ul { list-style: none; padding-left: 14px; margin: 3px 0; }
+  .tree li { cursor: pointer; padding: 2px 0; user-select: none; }
+  .tree .folder::before { content: "▸ "; color: var(--muted); display: inline-block; width: 16px; }
+  .tree .folder.open::before { content: "▾ "; }
+  .tree .file::before { content: "⋯ "; color: var(--muted); display: inline-block; width: 16px; }
+  .content { overflow: auto; padding: 12px; }
+  .codebox { background: #0f1520; border: 1px solid var(--border); border-radius: 10px; padding: 12px; }
+  .line { display: grid; grid-template-columns: 60px 1fr auto; gap: 8px; padding: 0 6px; }
+  .line-num { color: var(--muted); text-align: right; padding-right: 8px; }
+  .line.highlight { background: var(--highlight); }
+  .comment-badges { display: flex; gap: 6px; align-items: center; }
+  .badge { font-size: 11px; padding: 2px 6px; border-radius: 999px; border: 1px solid var(--border); background: #0e1420; }
+  .badge.INFO { border-color: var(--info); color: var(--info); }
+  .badge.WARNING { border-color: var(--warn); color: var(--warn); }
+  .badge.ERROR { border-color: var(--error); color: var(--error); }
+  .tooltip { position: relative; display: inline-block; }
+  .tooltip .tip { visibility: hidden; position: absolute; left: 0; top: 22px; background: #0b0f14; border: 1px solid var(--border); padding: 8px 10px; border-radius: 8px; width: 480px; max-width: 70vw; z-index: 100; white-space: pre-wrap; box-shadow: 0 10px 24px rgba(0,0,0,.35);}
+  .tooltip:hover .tip { visibility: visible; }
+  .filename { font-weight: 600; margin: 10px 0; }
+  .muted { color: var(--muted); }
+  .empty { padding: 20px; color: var(--muted); }
+  @media print {
+    header, .search { display: none; }
+    body { grid-template-columns: 1fr; }
+    .sidebar { display: none; }
+  }
+</style>
+</head>
+<body>
+  <header>
+    <h1>Code Review Report</h1>
+    <div class="chips" id="summaryChips"></div>
+    <button class="btn" onclick="window.print()">Download PDF</button>
+  </header>
+  <aside class="sidebar">
+    <div class="search"><input id="searchBox" placeholder="Search files… (type to filter)"/></div>
+    <div class="tree" id="tree"></div>
+  </aside>
+  <main class="content">
+    <div id="viewer" class="empty">Select a file from the left to view code & comments.</div>
+  </main>
+
+  <script type="application/json" id="review-data">%s</script>
+  <script>
+    const reviewData = JSON.parse(document.getElementById('review-data').textContent);
+
+    // Build counts
+    function summarize(data){
+      let info=0,warn=0,err=0,files=0,comments=0;
+      for (const [file, v] of Object.entries(data)) {
+        files++;
+        (v.comments||[]).forEach(c => {
+          comments++;
+          if (c.severity==='ERROR') err++; else if (c.severity==='WARNING') warn++; else info++;
+        });
+      }
+      return {files, comments, info, warn, err};
+    }
+
+    // Build a directory tree object
+    function pathTree(paths){
+      const root = {};
+      for (const p of Object.keys(paths)) {
+        const parts = p.split('/');
+        let cur = root;
+        for (let i=0;i<parts.length;i++){
+          const part = parts[i];
+          if(!cur[part]) cur[part] = {__children:{}, __file: null};
+          if(i===parts.length-1){ cur[part].__file = p; }
+          cur = cur[part].__children;
+        }
+      }
+      return root;
+    }
+
+    function renderTree(node, parent, filter=''){
+      const ul = document.createElement('ul');
+      parent.appendChild(ul);
+      for (const [name, val] of Object.entries(node)) {
+        const li = document.createElement('li');
+        const isFile = !!val.__file;
+        const text = document.createElement('span');
+        text.textContent = name;
+        li.appendChild(text);
+
+        const matches = (val.__file || name).toLowerCase().includes(filter);
+        if (!matches && !isFile) {
+          // Check if any descendants match
+          const tmp = document.createElement('div');
+          renderTree(val.__children, tmp, filter);
+          if (!tmp.querySelector('li')) continue; // prune
+        }
+
+        if (isFile) {
+          li.classList.add('file');
+          li.onclick = () => loadFile(val.__file);
+        } else {
+          li.classList.add('folder');
+          li.classList.add('open');
+          li.onclick = (e) => {
+            if (e.target === text) {
+              li.classList.toggle('open');
+              const childUl = li.querySelector(':scope > ul');
+              if (childUl) childUl.style.display = childUl.style.display === 'none' ? 'block' : 'none';
+            }
+          };
+          renderTree(val.__children, li, filter);
+        }
+        ul.appendChild(li);
+      }
+    }
+
+    function escHtml(s){
+      return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    }
+
+    function loadFile(filePath){
+      const file = reviewData[filePath];
+      const viewer = document.getElementById('viewer');
+      const lines = file.code;
+      const comments = file.comments || [];
+      const byLine = new Map();
+      comments.forEach(c => {
+        if(!byLine.has(c.line)) byLine.set(c.line, []);
+        byLine.get(c.line).push(c);
+      });
+
+      let html = `<div class="filename">${escHtml(filePath)}</div><div class="codebox">`;
+      for (let i=0;i<lines.length;i++){
+        const n = i+1;
+        const line = lines[i];
+        const lineComments = byLine.get(n) || [];
+        const has = lineComments.length>0;
+        html += `<div class="line ${has?'highlight':''}">
+          <div class="line-num">${n}</div>
+          <div class="code">${escHtml(line)}</div>
+          <div class="comment-badges">` +
+            lineComments.map(c => `
+              <span class="badge ${c.severity} tooltip">
+                ${c.severity}
+                <span class="tip">[${c.severity}] ${escHtml(c.comment)}</span>
+              </span>
+            `).join('') +
+          `</div>
+        </div>`;
+      }
+      html += `</div>`;
+      viewer.classList.remove('empty');
+      viewer.innerHTML = html;
+      viewer.scrollTop = 0;
+    }
+
+    // Initial render
+    const treeData = pathTree(reviewData);
+    const treeEl = document.getElementById('tree');
+    renderTree(treeData, treeEl);
+
+    // Summary chips
+    const s = summarize(reviewData);
+    const chips = document.getElementById('summaryChips');
+    chips.innerHTML = [
+      {label:'Files', val:s.files},
+      {label:'Comments', val:s.comments},
+      {label:'INFO', val:s.info},
+      {label:'WARNING', val:s.warn},
+      {label:'ERROR', val:s.err}
+    ].map(x => `<span class="chip">${x.label}: ${x.val}</span>`).join('');
+
+    // Search
+    const search = document.getElementById('searchBox');
+    search.addEventListener('input', () => {
+      treeEl.innerHTML = '';
+      renderTree(treeData, treeEl, search.value.toLowerCase().trim());
+    });
+  </script>
+</body>
+</html>
+""".formatted(json);
+    }
+
+    private static String toJson(Map<String, Object> map) {
+        // very small JSON serializer (no external runtime deps)
+        return serialize(map);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static String serialize(Object o) {
+        if (o == null) return "null";
+        if (o instanceof String s) return "\"" + s
+                .replace("\\", "\\\\")
+                .replace("\"", "\\\"")
+                .replace("\r", "\\r")
+                .replace("\n", "\\n") + "\"";
+        if (o instanceof Number || o instanceof Boolean) return o.toString();
+        if (o instanceof Map<?,?> m) {
+            return "{" + m.entrySet().stream()
+                    .map(e -> serialize(e.getKey().toString()) + ":" + serialize(e.getValue()))
+                    .collect(Collectors.joining(",")) + "}";
+        }
+        if (o instanceof Collection<?> c) {
+            return "[" + c.stream().map(HtmlReportGenerator::serialize).collect(Collectors.joining(",")) + "]";
+        }
+        // POJOs (ReviewComment)
+        try {
+            var clz = o.getClass();
+            var fields = clz.getFields();
+            Map<String,Object> m = new LinkedHashMap<>();
+            for (var f : fields) {
+                m.put(f.getName(), f.get(o));
+            }
+            return serialize(m);
+        } catch (Exception e) {
+            return "\"" + o.toString() + "\"";
+        }
+    }
+}
+
+
+---
+
+4) How to use in a project
+
+Add the plugin to your application repo pom.xml:
+
+<build>
+  <plugins>
+    <plugin>
+      <groupId>com.example</groupId>
+      <artifactId>code-review-plugin</artifactId>
+      <version>1.0.0</version>
+      <configuration>
+        <model>codellama:7b</model>
+        <ollamaUrl>http://localhost:11434</ollamaUrl>
+        <sourceIncludes>src/main/java/**,src/test/java/**</sourceIncludes>
+        <sourceExcludes>target/**,**/generated/**</sourceExcludes>
+        <failOnError>false</failOnError>
+      </configuration>
+    </plugin>
+  </plugins>
+</build>
+
+Run:
+
+# Make sure Ollama has the model ready:
+ollama pull codellama:7b
+# Start your review:
+mvn codereview:analyze
+# Open the HTML:
+xdg-open target/code-review-report.html  # (or open in any browser)
+
+
+---
+
+Notes & Tips
+
+Why stream:false? Ollama streams tokens by default; disabling streaming returns a single JSON block, which we parse reliably.
+
+Token/size limits: The plugin skips files over maxFileBytes (default 120 KB). Adjust as needed. For very large files, consider chunking by function/class.
+
+Strict JSON output: The prompt forces a pure JSON array. We also include a fallback extractor ([ { ... } ] regex) if the model adds text accidentally.
+
+Severities: Set by the model. You can post-process to downgrade/upgrade based on keywords if you want opinionated policies.
+
+PDF export: The “Download PDF” button uses window.print() and print CSS; choose “Save as PDF” in the dialog.
+
+
+
+---
+
+If you want, I can also add:
+
+Inline diff view vs previous commit (feed diff to model, annotate changed lines only)
+
+SARIF output for CI systems (so comments show in GitHub/ADO security panels)
+
+Rule + LLM hybrid (PMD/Checkstyle/SpotBugs results merged with LLM comments)
+
+
+Want me to wire in SARIF export next so you can surface these comments in CI and IDEs?
+
