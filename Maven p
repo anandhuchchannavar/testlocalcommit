@@ -1,0 +1,727 @@
+Awesome — here’s a complete, working Maven plugin that reviews code using AWS Bedrock’s Amazon Nova (nova-lite by default) and generates a fully-interactive HTML report with:
+
+Collapsible project tree
+
+Inline line-level comment bubbles with tooltips
+
+Severity colors (INFO / WARNING / ERROR)
+
+Sidebar search (live filter)
+
+“Download PDF” (print-to-PDF)
+
+Model origin label on every comment (e.g., “Nova Lite”)
+
+Works with IAM creds (no token in code)
+
+
+You can drop this in as a standalone Maven module (packaging maven-plugin) and use it in any repo.
+
+
+---
+
+1) pom.xml (plugin module)
+
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.example</groupId>
+  <artifactId>code-review-plugin</artifactId>
+  <version>1.2.0</version>
+  <packaging>maven-plugin</packaging>
+
+  <properties>
+    <maven.compiler.source>17</maven.compiler.source>
+    <maven.compiler.target>17</maven.compiler.target>
+    <java.version>17</java.version>
+  </properties>
+
+  <dependencies>
+    <!-- Jackson -->
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+      <version>2.17.2</version>
+    </dependency>
+
+    <!-- AWS Bedrock Runtime SDK (v2) -->
+    <dependency>
+      <groupId>software.amazon.awssdk</groupId>
+      <artifactId>bedrockruntime</artifactId>
+      <version>2.25.37</version>
+    </dependency>
+
+    <!-- Plexus utils (optional helpers) -->
+    <dependency>
+      <groupId>org.codehaus.plexus</groupId>
+      <artifactId>plexus-utils</artifactId>
+      <version>4.0.1</version>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-plugin-plugin</artifactId>
+        <version>3.10.2</version>
+        <configuration>
+          <goalPrefix>codereview</goalPrefix>
+        </configuration>
+        <executions>
+          <execution>
+            <goals>
+              <goal>descriptor</goal>
+            </goals>
+          </execution>
+        </executions>
+      </plugin>
+
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.13.0</version>
+        <configuration>
+          <source>${java.version}</source>
+          <target>${java.version}</target>
+          <release>${java.version}</release>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</project>
+
+
+---
+
+2) src/main/java/com/example/codereview/CodeReviewMojo.java
+
+package com.example.codereview;
+
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.maven.plugin.AbstractMojo;
+import org.apache.maven.plugin.MojoExecutionException;
+import org.apache.maven.plugins.annotations.*;
+
+import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
+import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider;
+import software.amazon.awssdk.auth.credentials.ProfileCredentialsProvider;
+import software.amazon.awssdk.core.SdkBytes;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.bedrockruntime.BedrockRuntimeClient;
+import software.amazon.awssdk.services.bedrockruntime.model.InvokeModelRequest;
+import software.amazon.awssdk.services.bedrockruntime.model.InvokeModelResponse;
+
+import java.io.File;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
+import java.util.*;
+import java.util.concurrent.Executors;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+
+@Mojo(name = "analyze", defaultPhase = LifecyclePhase.VERIFY, threadSafe = true)
+public class CodeReviewMojo extends AbstractMojo {
+
+    @Parameter(defaultValue = "${project.basedir}", readonly = true, required = true)
+    private File baseDir;
+
+    @Parameter(property = "codereview.sourceIncludes", defaultValue = "src/main/java/**,src/test/java/**")
+    private String sourceIncludes;
+
+    @Parameter(property = "codereview.sourceExcludes", defaultValue = "target/**,**/generated/**,**/build/**")
+    private String sourceExcludes;
+
+    @Parameter(property = "codereview.maxFileBytes", defaultValue = "120000")
+    private int maxFileBytes;
+
+    /** Bedrock model ID. Use Nova Lite by default. Examples:
+     *  amazon.nova-lite-v1:0, amazon.nova-pro-v1:0, amazon.nova-micro-v1:0
+     */
+    @Parameter(property = "codereview.modelId", defaultValue = "amazon.nova-lite-v1:0")
+    private String modelId;
+
+    /** Human-friendly label shown in the HTML report on each comment */
+    @Parameter(property = "codereview.modelLabel", defaultValue = "Nova Lite")
+    private String modelLabel;
+
+    @Parameter(property = "codereview.region", defaultValue = "us-east-1")
+    private String region;
+
+    /** Optional AWS CLI profile. If empty, DefaultCredentialsProvider is used. */
+    @Parameter(property = "codereview.awsProfile", defaultValue = "")
+    private String awsProfile;
+
+    @Parameter(property = "codereview.temperature", defaultValue = "0.1")
+    private double temperature;
+
+    @Parameter(property = "codereview.parallel", defaultValue = "2")
+    private int parallel;
+
+    @Parameter(property = "codereview.outputFile", defaultValue = "${project.build.directory}/code-review-report.html")
+    private File outputFile;
+
+    @Parameter(property = "codereview.failOnError", defaultValue = "false")
+    private boolean failOnError;
+
+    private final ObjectMapper mapper = new ObjectMapper();
+
+    @Override
+    public void execute() throws MojoExecutionException {
+        AwsCredentialsProvider creds =
+            (awsProfile != null && !awsProfile.isBlank())
+                ? ProfileCredentialsProvider.create(awsProfile)
+                : DefaultCredentialsProvider.create();
+
+        try (BedrockRuntimeClient client = BedrockRuntimeClient.builder()
+                .region(Region.of(region))
+                .credentialsProvider(creds)
+                .build()) {
+
+            var includeGlobs = splitCsv(sourceIncludes);
+            var excludeGlobs = splitCsv(sourceExcludes);
+            List<Path> files = scanSources(baseDir.toPath(), includeGlobs, excludeGlobs);
+            if (files.isEmpty()) {
+                getLog().warn("No source files matched includes/excludes.");
+            }
+
+            Map<String, Object> reviewData = new LinkedHashMap<>();
+            var pool = Executors.newFixedThreadPool(Math.max(1, parallel));
+            List<java.util.concurrent.Future<?>> futures = new ArrayList<>();
+
+            for (Path file : files) {
+                futures.add(pool.submit(() -> {
+                    try {
+                        byte[] bytes = Files.readAllBytes(file);
+                        if (bytes.length > maxFileBytes) {
+                            getLog().info("Skipping large file: " + baseDir.toPath().relativize(file) +
+                                    " (" + bytes.length + " bytes)");
+                            return;
+                        }
+                        String code = new String(bytes, StandardCharsets.UTF_8);
+                        List<String> lines = codeLines(code);
+                        List<ReviewComment> comments = requestReview(client, file, code, modelId, modelLabel);
+
+                        synchronized (reviewData) {
+                            reviewData.put(unixPath(baseDir.toPath().relativize(file).toString()),
+                                    Map.of("code", lines, "comments", comments));
+                        }
+                    } catch (Exception e) {
+                        getLog().error("Failed to review file " + file + ": " + e.getMessage(), e);
+                    }
+                }));
+            }
+            for (var f : futures) try { f.get(); } catch (Exception ignore) {}
+            pool.shutdown();
+
+            String html = HtmlReportGenerator.generate(reviewData, modelLabel);
+            outputFile.getParentFile().mkdirs();
+            Files.writeString(outputFile.toPath(), html, StandardCharsets.UTF_8);
+
+            getLog().info("Code review report generated: " + outputFile.getAbsolutePath());
+
+            if (failOnError && containsSeverity(reviewData, "ERROR")) {
+                throw new MojoExecutionException("Code review found ERROR-level comments.");
+            }
+        } catch (Exception e) {
+            throw new MojoExecutionException("Code review failed", e);
+        }
+    }
+
+    private List<ReviewComment> requestReview(BedrockRuntimeClient client,
+                                              Path file, String code,
+                                              String modelId, String modelLabel) throws IOException {
+        String prompt = ReviewPrompt.forFile(file.getFileName().toString(), code);
+
+        // Amazon Nova text interface (JSON): {"inputText": "..."} -> {"outputText": "..."}
+        var bodyJson = "{\"inputText\":" + jsonEscape(prompt) + ",\"textGenerationConfig\":{\"temperature\":" + temperature + ",\"maxTokenCount\":800}}";
+
+        InvokeModelRequest req = InvokeModelRequest.builder()
+                .modelId(modelId)
+                .contentType("application/json")
+                .accept("application/json")
+                .body(SdkBytes.fromUtf8String(bodyJson))
+                .build();
+
+        InvokeModelResponse resp = client.invokeModel(req);
+        String raw = resp.body().asUtf8String();
+
+        // Try to parse outputText if present, else use as-is
+        String outputText = JsonExtractor.field(raw, "outputText");
+        if (outputText == null) outputText = raw;
+
+        // We expect a pure JSON array from the model; extract leniently if needed.
+        String jsonArray = JsonExtractor.extractJsonArray(outputText);
+        if (jsonArray == null) {
+            getLog().warn("Model returned non-JSON for " + file + ". Skipping comments.");
+            return List.of();
+        }
+
+        List<ReviewComment> list;
+        try {
+            list = mapper.readValue(jsonArray, new TypeReference<List<ReviewComment>>() {});
+        } catch (Exception e) {
+            getLog().warn("Failed to parse JSON for " + file + ": " + e.getMessage());
+            return List.of();
+        }
+
+        // Stamp model label into each comment (shown in HTML)
+        for (ReviewComment c : list) c.model = modelLabel;
+        return list;
+    }
+
+    private static List<String> codeLines(String code) {
+        return Arrays.asList(code.replace("\r\n", "\n").replace("\r", "\n").split("\n", -1));
+    }
+
+    private static List<Path> scanSources(Path base, List<String> includes, List<String> excludes) throws IOException {
+        var matcherIncludes = includes.stream().map(g -> base.getFileSystem().getPathMatcher("glob:" + g)).toList();
+        var matcherExcludes = excludes.stream().map(g -> base.getFileSystem().getPathMatcher("glob:" + g)).toList();
+
+        try (var s = Files.walk(base)) {
+            return s.filter(Files::isRegularFile)
+                    .filter(p -> matcherIncludes.stream().anyMatch(m -> m.matches(base.relativize(p))))
+                    .filter(p -> matcherExcludes.stream().noneMatch(m -> m.matches(base.relativize(p))))
+                    .filter(p -> {
+                        String n = p.getFileName().toString().toLowerCase(Locale.ROOT);
+                        return n.endsWith(".java") || n.endsWith(".kt") || n.endsWith(".xml")
+                                || n.endsWith(".properties") || n.endsWith(".yml") || n.endsWith(".yaml") || n.endsWith(".md");
+                    })
+                    .sorted()
+                    .collect(Collectors.toList());
+        }
+    }
+
+    private static List<String> splitCsv(String csv) {
+        if (csv == null || csv.isBlank()) return List.of();
+        return Arrays.stream(csv.split(",")).map(String::trim).filter(s -> !s.isBlank()).toList();
+    }
+
+    private static String unixPath(String p) { return p.replace('\\', '/'); }
+
+    private static boolean containsSeverity(Map<String, Object> reviewData, String sev) {
+        for (Object v : reviewData.values()) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> file = (Map<String, Object>) v;
+            @SuppressWarnings("unchecked")
+            List<Map<String, Object>> comments = (List<Map<String, Object>>) file.get("comments");
+            if (comments != null) {
+                for (var c : comments) {
+                    if (sev.equals(c.get("severity"))) return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    // ---------- Data model ----------
+
+    public static class ReviewComment {
+        public int line;             // 1-based
+        public String severity;      // INFO | WARNING | ERROR
+        public String comment;       // short suggestion
+        public String model;         // e.g., "Nova Lite"
+
+        public ReviewComment() {}
+        public ReviewComment(int line, String severity, String comment, String model) {
+            this.line = line; this.severity = severity; this.comment = comment; this.model = model;
+        }
+    }
+
+    // ---------- Prompt ----------
+
+    static final class ReviewPrompt {
+        static String forFile(String filename, String code) {
+            return """
+                You are a strict senior Java/Spring Boot code reviewer.
+                Review file: %s
+
+                Return ONLY a JSON array. NO extra text.
+                Each element must be:
+                {"line": <1-based line number>, "severity": "INFO|WARNING|ERROR", "comment": "actionable advice under 220 chars"}
+
+                Rules:
+                - Use 1-based line numbers from the code below.
+                - Be precise and actionable.
+                - Prefer security, correctness, performance, and Spring best practices.
+                - If no issues, return [] exactly.
+
+                Code:
+                ---
+                %s
+                ---
+                """.formatted(filename, code);
+        }
+    }
+
+    // ---------- JSON helpers ----------
+
+    static final class JsonExtractor {
+        private static final Pattern ARRAY = Pattern.compile("\\[\\s*\\{[\\s\\S]*?}]");
+        private static final Pattern FIELD_OUTPUTTEXT = Pattern.compile("\"outputText\"\\s*:\\s*\"([\\s\\S]*?)\"");
+        static String extractJsonArray(String s) {
+            var m = ARRAY.matcher(s.trim());
+            return m.find() ? m.group() : null;
+        }
+        static String field(String json, String field) {
+            if ("outputText".equals(field)) {
+                var m = FIELD_OUTPUTTEXT.matcher(json);
+                if (m.find()) return unescape(m.group(1));
+            }
+            return null;
+        }
+        private static String unescape(String s) {
+            return s.replace("\\n", "\n")
+                    .replace("\\r", "\r")
+                    .replace("\\t", "\t")
+                    .replace("\\\"", "\"")
+                    .replace("\\\\", "\\");
+        }
+    }
+
+    private static String jsonEscape(String s) {
+        return "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"")
+                .replace("\r", "\\r").replace("\n", "\\n") + "\"";
+    }
+}
+
+
+---
+
+3) src/main/java/com/example/codereview/HtmlReportGenerator.java
+
+package com.example.codereview;
+
+import java.util.*;
+import java.util.stream.Collectors;
+
+public final class HtmlReportGenerator {
+
+    private HtmlReportGenerator() {}
+
+    @SuppressWarnings("unchecked")
+    public static String generate(Map<String, Object> reviewData, String modelLabel) {
+        String json = toJson(reviewData);
+
+        return """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Code Review Report</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<style>
+  :root {
+    --bg: #0b0f14;
+    --panel: #121821;
+    --muted: #9aa4b2;
+    --text: #e8edf3;
+    --border: #263143;
+    --info: #388bfd;
+    --warn: #f5a524;
+    --error: #ef4444;
+    --highlight: #1f2a3a;
+    --chip: #1a2230;
+    --model: #7c3aed;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; height: 100vh; display: grid; grid-template-columns: 320px 1fr; grid-template-rows: auto 1fr; }
+  header { grid-column: 1 / span 2; padding: 10px 14px; border-bottom: 1px solid var(--border); background: var(--panel); display: flex; align-items: center; gap: 12px; }
+  header h1 { font-size: 16px; margin: 0; letter-spacing: .3px; }
+  header .chips { margin-left: auto; display: flex; gap: 8px; }
+  .chip { background: var(--chip); border: 1px solid var(--border); padding: 3px 8px; border-radius: 999px; font-size: 12px; }
+  .btn { background: transparent; border: 1px solid var(--border); color: var(--text); padding: 6px 10px; border-radius: 8px; cursor: pointer; }
+  .btn:hover { background: #1a2433; }
+  .sidebar { border-right: 1px solid var(--border); overflow: auto; background: var(--panel); padding: 12px; }
+  .search { width: 100%; margin-bottom: 10px; }
+  .search input { width: 100%; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--border); background: #0f1520; color: var(--text); }
+  .tree ul { list-style: none; padding-left: 14px; margin: 3px 0; }
+  .tree li { cursor: pointer; padding: 2px 0; user-select: none; }
+  .tree .folder::before { content: "▸ "; color: var(--muted); display: inline-block; width: 16px; }
+  .tree .folder.open::before { content: "▾ "; }
+  .tree .file::before { content: "⋯ "; color: var(--muted); display: inline-block; width: 16px; }
+  .content { overflow: auto; padding: 12px; }
+  .codebox { background: #0f1520; border: 1px solid var(--border); border-radius: 10px; padding: 12px; }
+  .line { display: grid; grid-template-columns: 60px 1fr auto; gap: 8px; padding: 0 6px; }
+  .line-num { color: var(--muted); text-align: right; padding-right: 8px; }
+  .line.highlight { background: var(--highlight); }
+  .comment-badges { display: flex; gap: 6px; align-items: center; }
+  .badge { font-size: 11px; padding: 2px 6px; border-radius: 999px; border: 1px solid var(--border); background: #0e1420; }
+  .badge.INFO { border-color: var(--info); color: var(--info); }
+  .badge.WARNING { border-color: var(--warn); color: var(--warn); }
+  .badge.ERROR { border-color: var(--error); color: var(--error); }
+  .badge.MODEL { border-color: var(--model); color: var(--model); }
+  .tooltip { position: relative; display: inline-block; }
+  .tooltip .tip { visibility: hidden; position: absolute; left: 0; top: 22px; background: #0b0f14; border: 1px solid var(--border); padding: 8px 10px; border-radius: 8px; width: 520px; max-width: 70vw; z-index: 100; white-space: pre-wrap; box-shadow: 0 10px 24px rgba(0,0,0,.35);}
+  .tooltip:hover .tip { visibility: visible; }
+  .filename { font-weight: 600; margin: 10px 0; }
+  .muted { color: var(--muted); }
+  .empty { padding: 20px; color: var(--muted); }
+  @media print {
+    header, .search { display: none; }
+    body { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
+    .sidebar { display: none; }
+  }
+</style>
+</head>
+<body>
+  <header>
+    <h1>Code Review Report</h1>
+    <div class="chips" id="summaryChips"></div>
+    <button class="btn" onclick="window.print()">Download PDF</button>
+  </header>
+  <aside class="sidebar">
+    <div class="search"><input id="searchBox" placeholder="Search files… (type to filter)"/></div>
+    <div class="tree" id="tree"></div>
+  </aside>
+  <main class="content">
+    <div id="viewer" class="empty">Select a file from the left to view code & comments.</div>
+  </main>
+
+  <script type="application/json" id="review-data">%s</script>
+  <script>
+    const reviewData = JSON.parse(document.getElementById('review-data').textContent);
+
+    function summarize(data){
+      let info=0,warn=0,err=0,files=0,comments=0;
+      for (const [file, v] of Object.entries(data)) {
+        files++;
+        (v.comments||[]).forEach(c => {
+          comments++;
+          if (c.severity==='ERROR') err++; else if (c.severity==='WARNING') warn++; else info++;
+        });
+      }
+      return {files, comments, info, warn, err};
+    }
+
+    function pathTree(paths){
+      const root = {};
+      for (const p of Object.keys(paths)) {
+        const parts = p.split('/');
+        let cur = root;
+        for (let i=0;i<parts.length;i++){
+          const part = parts[i];
+          if(!cur[part]) cur[part] = {__children:{}, __file: null};
+          if(i===parts.length-1){ cur[part].__file = p; }
+          cur = cur[part].__children;
+        }
+      }
+      return root;
+    }
+
+    function renderTree(node, parent, filter=''){
+      const ul = document.createElement('ul');
+      parent.appendChild(ul);
+      for (const [name, val] of Object.entries(node)) {
+        const isFile = !!val.__file;
+        const displayName = name;
+        const li = document.createElement('li');
+        const text = document.createElement('span');
+        text.textContent = displayName;
+        li.appendChild(text);
+
+        const matches = (val.__file || name).toLowerCase().includes(filter);
+        if (!matches && !isFile) {
+          const tmp = document.createElement('div');
+          renderTree(val.__children, tmp, filter);
+          if (!tmp.querySelector('li')) continue;
+        }
+
+        if (isFile) {
+          li.classList.add('file');
+          li.onclick = () => loadFile(val.__file);
+        } else {
+          li.classList.add('folder','open');
+          li.onclick = (e) => {
+            if (e.target === text) {
+              li.classList.toggle('open');
+              const childUl = li.querySelector(':scope > ul');
+              if (childUl) childUl.style.display = childUl.style.display === 'none' ? 'block' : 'none';
+            }
+          };
+          renderTree(val.__children, li, filter);
+        }
+        ul.appendChild(li);
+      }
+    }
+
+    function escHtml(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+    function loadFile(filePath){
+      const file = reviewData[filePath];
+      const viewer = document.getElementById('viewer');
+      const lines = file.code;
+      const comments = file.comments || [];
+      const byLine = new Map();
+      comments.forEach(c => {
+        if(!byLine.has(c.line)) byLine.set(c.line, []);
+        byLine.get(c.line).push(c);
+      });
+
+      let html = `<div class="filename">${escHtml(filePath)}</div><div class="codebox">`;
+      for (let i=0;i<lines.length;i++){
+        const n = i+1;
+        const line = lines[i];
+        const lineComments = byLine.get(n) || [];
+        const has = lineComments.length>0;
+        html += `<div class="line ${has?'highlight':''}">
+          <div class="line-num">${n}</div>
+          <div class="code">${escHtml(line)}</div>
+          <div class="comment-badges">` +
+            lineComments.map(c => `
+              <span class="badge MODEL">${escHtml(c.model || '${modelLabel}')}</span>
+              <span class="badge ${c.severity} tooltip">
+                ${c.severity}
+                <span class="tip">[${escHtml(c.model || '${modelLabel}')} • ${c.severity}] ${escHtml(c.comment)}</span>
+              </span>
+            `).join('') +
+          `</div>
+        </div>`;
+      }
+      html += `</div>`;
+      viewer.classList.remove('empty');
+      viewer.innerHTML = html;
+      viewer.scrollTop = 0;
+    }
+
+    const treeData = pathTree(reviewData);
+    const treeEl = document.getElementById('tree');
+    renderTree(treeData, treeEl);
+
+    const s = summarize(reviewData);
+    const chips = document.getElementById('summaryChips');
+    chips.innerHTML = [
+      {label:'Files', val:s.files},
+      {label:'Comments', val:s.comments},
+      {label:'INFO', val:s.info},
+      {label:'WARNING', val:s.warn},
+      {label:'ERROR', val:s.err}
+    ].map(x => `<span class="chip">${x.label}: ${x.val}</span>`).join('');
+
+    const search = document.getElementById('searchBox');
+    search.addEventListener('input', () => {
+      treeEl.innerHTML = '';
+      renderTree(treeData, treeEl, search.value.toLowerCase().trim());
+    });
+  </script>
+</body>
+</html>
+""".formatted(json);
+    }
+
+    private static String toJson(Map<String, Object> map) {
+        return serialize(map);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static String serialize(Object o) {
+        if (o == null) return "null";
+        if (o instanceof String s) return "\"" + s
+                .replace("\\", "\\\\")
+                .replace("\"", "\\\"")
+                .replace("\r", "\\r")
+                .replace("\n", "\\n") + "\"";
+        if (o instanceof Number || o instanceof Boolean) return o.toString();
+        if (o instanceof Map<?,?> m) {
+            return "{" + m.entrySet().stream()
+                    .map(e -> serialize(e.getKey().toString()) + ":" + serialize(e.getValue()))
+                    .collect(Collectors.joining(",")) + "}";
+        }
+        if (o instanceof Collection<?> c) {
+            return "[" + c.stream().map(HtmlReportGenerator::serialize).collect(Collectors.joining(",")) + "]";
+        }
+        // POJOs (ReviewComment)
+        try {
+            var clz = o.getClass();
+            var fields = clz.getFields();
+            Map<String,Object> m = new LinkedHashMap<>();
+            for (var f : fields) {
+                m.put(f.getName(), f.get(o));
+            }
+            return serialize(m);
+        } catch (Exception e) {
+            return "\"" + o.toString() + "\"";
+        }
+    }
+}
+
+
+---
+
+4) How to use in your application repo
+
+Add this plugin to the application project’s pom.xml:
+
+<build>
+  <plugins>
+    <plugin>
+      <groupId>com.example</groupId>
+      <artifactId>code-review-plugin</artifactId>
+      <version>1.2.0</version>
+      <configuration>
+        <modelId>amazon.nova-lite-v1:0</modelId>
+        <modelLabel>Nova Lite</modelLabel>
+        <region>us-east-1</region>
+        <!-- Optional: use a specific AWS CLI profile instead of default chain -->
+        <!-- <awsProfile>dev</awsProfile> -->
+        <sourceIncludes>src/main/java/**,src/test/java/**</sourceIncludes>
+        <sourceExcludes>target/**,**/generated/**</sourceExcludes>
+        <failOnError>false</failOnError>
+      </configuration>
+    </plugin>
+  </plugins>
+</build>
+
+Credentials (no “token”):
+Make sure your environment can call Bedrock:
+
+aws configure → default profile with region & keys
+
+or set env vars: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION
+
+or run on AWS with an IAM role
+
+
+Your IAM policy needs at least:
+
+{
+  "Version":"2012-10-17",
+  "Statement":[
+    {"Effect":"Allow","Action":["bedrock:InvokeModel","bedrock:InvokeModelWithResponseStream"],"Resource":"*"}
+  ]
+}
+
+Run the review:
+
+mvn codereview:analyze
+# Open the interactive report:
+open target/code-review-report.html     # macOS
+xdg-open target/code-review-report.html # Linux
+start target\code-review-report.html    # Windows
+
+
+---
+
+Notes / Tips
+
+Model swap: change to amazon.nova-pro-v1:0 and set <modelLabel>Nova Pro</modelLabel> for deeper reviews.
+
+Output parsing: We enforce a strict JSON array from the model; the HTML shows a purple MODEL badge (“Nova Lite” / “Nova Pro”) on every comment.
+
+Large files: Default maxFileBytes=120000; increase or implement chunking if needed.
+
+Fail build on errors: set <failOnError>true</failOnError> to make CI fail if any ERROR comments appear.
+
+PDF export: “Download PDF” invokes window.print() with print CSS.
+
+
+
+---
+
+If you want, I can also add a SARIF exporter (so comments show up directly in GitHub Security / ADO Code Scanning) or a hybrid mode (Nova Lite scan → auto-escalate risky files to Nova Pro).
+
+≠======≠=========================
+
+this is different 
+
