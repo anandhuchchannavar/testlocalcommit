@@ -1,0 +1,366 @@
+Perfect — you’ve already got a rock-solid offline Ollama Maven plugin.
+Let’s now rewrite it for AWS Bedrock, so instead of hitting localhost:11434/api/generate, it calls Bedrock models (Claude, Llama, Mistral, etc.) using the AWS SDK for Java v2.
+
+Everything else (HTML UI, project tree, inline comments, severity chips, search, PDF export) stays the same ✅.
+
+
+---
+
+🔹 Key Changes for AWS Bedrock Version
+
+1) pom.xml (plugin module)
+
+Add AWS Bedrock Runtime SDK:
+
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.example</groupId>
+  <artifactId>code-review-plugin</artifactId>
+  <version>1.1.0</version>
+  <packaging>maven-plugin</packaging>
+
+  <properties>
+    <java.version>17</java.version>
+  </properties>
+
+  <dependencies>
+    <!-- Jackson -->
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+      <version>2.17.2</version>
+    </dependency>
+
+    <!-- AWS Bedrock Runtime -->
+    <dependency>
+      <groupId>software.amazon.awssdk</groupId>
+      <artifactId>bedrockruntime</artifactId>
+      <version>2.25.37</version> <!-- latest -->
+    </dependency>
+
+    <!-- Plexus utils (globbing, safe IO) -->
+    <dependency>
+      <groupId>org.codehaus.plexus</groupId>
+      <artifactId>plexus-utils</artifactId>
+      <version>4.0.1</version>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-plugin-plugin</artifactId>
+        <version>3.10.2</version>
+        <configuration>
+          <goalPrefix>codereview</goalPrefix>
+        </configuration>
+        <executions>
+          <execution>
+            <goals>
+              <goal>descriptor</goal>
+            </goals>
+          </execution>
+        </executions>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.13.0</version>
+        <configuration>
+          <source>17</source>
+          <target>17</target>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</project>
+
+
+---
+
+2) Mojo: CodeReviewMojo.java
+
+This is mostly the same as your Ollama version —
+the big change is that instead of OllamaClient, we’ll wire in a BedrockClient.
+
+package com.example.codereview;
+
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.maven.plugin.AbstractMojo;
+import org.apache.maven.plugin.MojoExecutionException;
+import org.apache.maven.plugins.annotations.*;
+
+import software.amazon.awssdk.core.SdkBytes;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.bedrockruntime.BedrockRuntimeClient;
+import software.amazon.awssdk.services.bedrockruntime.model.InvokeModelRequest;
+import software.amazon.awssdk.services.bedrockruntime.model.InvokeModelResponse;
+
+import java.io.File;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
+import java.util.*;
+import java.util.concurrent.Executors;
+import java.util.stream.Collectors;
+
+@Mojo(name = "analyze", defaultPhase = LifecyclePhase.VERIFY, threadSafe = true)
+public class CodeReviewMojo extends AbstractMojo {
+
+    @Parameter(defaultValue = "${project.basedir}", readonly = true, required = true)
+    private File baseDir;
+
+    @Parameter(property = "codereview.sourceIncludes", defaultValue = "src/main/java/**,src/test/java/**")
+    private String sourceIncludes;
+
+    @Parameter(property = "codereview.sourceExcludes", defaultValue = "target/**,**/generated/**,**/build/**")
+    private String sourceExcludes;
+
+    @Parameter(property = "codereview.maxFileBytes", defaultValue = "120000")
+    private int maxFileBytes;
+
+    @Parameter(property = "codereview.modelId", defaultValue = "anthropic.claude-3-sonnet-20240229-v1:0")
+    private String modelId;
+
+    @Parameter(property = "codereview.region", defaultValue = "us-east-1")
+    private String region;
+
+    @Parameter(property = "codereview.temperature", defaultValue = "0.1")
+    private double temperature;
+
+    @Parameter(property = "codereview.parallel", defaultValue = "2")
+    private int parallel;
+
+    @Parameter(property = "codereview.outputFile", defaultValue = "${project.build.directory}/code-review-report.html")
+    private File outputFile;
+
+    @Parameter(property = "codereview.failOnError", defaultValue = "false")
+    private boolean failOnError;
+
+    private final ObjectMapper mapper = new ObjectMapper();
+
+    @Override
+    public void execute() throws MojoExecutionException {
+        try (BedrockRuntimeClient client = BedrockRuntimeClient.builder()
+                .region(Region.of(region))
+                .build()) {
+
+            var includeGlobs = splitCsv(sourceIncludes);
+            var excludeGlobs = splitCsv(sourceExcludes);
+
+            List<Path> files = scanSources(baseDir.toPath(), includeGlobs, excludeGlobs);
+            if (files.isEmpty()) {
+                getLog().warn("No source files matched includes/excludes.");
+            }
+
+            Map<String, Object> reviewData = new LinkedHashMap<>();
+            var pool = Executors.newFixedThreadPool(Math.max(1, parallel));
+            List<java.util.concurrent.Future<?>> futures = new ArrayList<>();
+
+            for (Path file : files) {
+                futures.add(pool.submit(() -> {
+                    try {
+                        byte[] bytes = Files.readAllBytes(file);
+                        if (bytes.length > maxFileBytes) {
+                            getLog().info("Skipping large file: " + baseDir.toPath().relativize(file));
+                            return;
+                        }
+                        String code = new String(bytes, StandardCharsets.UTF_8);
+                        List<String> lines = codeLines(code);
+                        List<ReviewComment> comments = requestReview(client, file, code);
+
+                        synchronized (reviewData) {
+                            reviewData.put(unixPath(baseDir.toPath().relativize(file).toString()),
+                                    Map.of("code", lines, "comments", comments));
+                        }
+                    } catch (Exception e) {
+                        getLog().error("Failed to review file " + file, e);
+                    }
+                }));
+            }
+            for (var f : futures) f.get();
+            pool.shutdown();
+
+            String html = HtmlReportGenerator.generate(reviewData);
+            outputFile.getParentFile().mkdirs();
+            Files.writeString(outputFile.toPath(), html, StandardCharsets.UTF_8);
+
+            getLog().info("Code review report generated: " + outputFile.getAbsolutePath());
+
+            if (failOnError && containsSeverity(reviewData, "ERROR")) {
+                throw new MojoExecutionException("Code review found ERROR-level comments.");
+            }
+        } catch (Exception e) {
+            throw new MojoExecutionException("Code review failed", e);
+        }
+    }
+
+    private List<ReviewComment> requestReview(BedrockRuntimeClient client, Path file, String code) throws IOException {
+        String prompt = ReviewPrompt.forJavaFile(file.getFileName().toString(), code);
+
+        String body = """
+        {
+          "prompt": %s,
+          "max_tokens_to_sample": 500,
+          "temperature": %s
+        }
+        """.formatted(jsonEscape(prompt), Double.toString(temperature));
+
+        InvokeModelRequest request = InvokeModelRequest.builder()
+                .modelId(modelId)
+                .body(SdkBytes.fromUtf8String(body))
+                .build();
+
+        InvokeModelResponse resp = client.invokeModel(request);
+        String result = resp.body().asUtf8String();
+
+        // Claude returns {"completion":"..."}
+        String jsonArray = JsonExtractor.extractJsonArray(result);
+        if (jsonArray == null) {
+            getLog().warn("Bedrock returned non-JSON for " + file);
+            return List.of();
+        }
+        try {
+            return mapper.readValue(jsonArray, new TypeReference<List<ReviewComment>>() {});
+        } catch (Exception e) {
+            getLog().warn("Failed to parse JSON for " + file + ": " + e.getMessage());
+            return List.of();
+        }
+    }
+
+    private static List<String> codeLines(String code) {
+        return Arrays.asList(code.replace("\r\n", "\n").replace("\r", "\n").split("\n", -1));
+    }
+
+    private static List<Path> scanSources(Path base, List<String> includes, List<String> excludes) throws IOException {
+        var matcherIncludes = includes.stream().map(g -> base.getFileSystem().getPathMatcher("glob:" + g)).toList();
+        var matcherExcludes = excludes.stream().map(g -> base.getFileSystem().getPathMatcher("glob:" + g)).toList();
+
+        try (var s = Files.walk(base)) {
+            return s.filter(Files::isRegularFile)
+                    .filter(p -> matcherIncludes.stream().anyMatch(m -> m.matches(base.relativize(p))))
+                    .filter(p -> matcherExcludes.stream().noneMatch(m -> m.matches(base.relativize(p))))
+                    .filter(p -> {
+                        String n = p.getFileName().toString();
+                        return n.endsWith(".java") || n.endsWith(".kt") || n.endsWith(".xml")
+                                || n.endsWith(".properties") || n.endsWith(".yml") || n.endsWith(".yaml") || n.endsWith(".md");
+                    })
+                    .sorted()
+                    .collect(Collectors.toList());
+        }
+    }
+
+    private static List<String> splitCsv(String csv) {
+        if (csv == null || csv.isBlank()) return List.of();
+        return Arrays.stream(csv.split(",")).map(String::trim).filter(s -> !s.isBlank()).toList();
+    }
+
+    private static String unixPath(String p) { return p.replace('\\', '/'); }
+
+    public static class ReviewComment {
+        public int line;
+        public String severity;
+        public String comment;
+    }
+
+    static final class ReviewPrompt {
+        static String forJavaFile(String filename, String code) {
+            return """
+                You are a strict code reviewer. Review the file: %s.
+                Return ONLY a JSON array, no preface or postface.
+                Each element: {"line": <1-based line>, "severity": "INFO|WARNING|ERROR", "comment": "short suggestion"}.
+                Rules:
+                - 1-based line numbers
+                - Comments <220 chars
+                - [] if no issues
+
+                Code:
+                ---
+                %s
+                ---
+            """.formatted(filename, code);
+        }
+    }
+
+    static final class JsonExtractor {
+        private static final java.util.regex.Pattern ARRAY = java.util.regex.Pattern.compile("\\[\\s*\\{[\\s\\S]*?}]");
+        static String extractJsonArray(String s) {
+            var m = ARRAY.matcher(s.trim());
+            return m.find() ? m.group() : null;
+        }
+    }
+
+    private static String jsonEscape(String s) {
+        return "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"")
+                .replace("\r", "\\r").replace("\n", "\\n") + "\"";
+    }
+
+    private static boolean containsSeverity(Map<String, Object> reviewData, String sev) {
+        for (Object v : reviewData.values()) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> file = (Map<String, Object>) v;
+            @SuppressWarnings("unchecked")
+            List<Map<String, Object>> comments = (List<Map<String, Object>>) file.get("comments");
+            if (comments != null) {
+                for (var c : comments) {
+                    if (sev.equals(c.get("severity"))) return true;
+                }
+            }
+        }
+        return false;
+    }
+}
+
+
+---
+
+3) HtmlReportGenerator.java
+
+Unchanged ✅ (same collapsible project tree, severity badges, tooltips, PDF export).
+
+
+---
+
+4) Usage in a Project
+
+In your application repo’s pom.xml:
+
+<build>
+  <plugins>
+    <plugin>
+      <groupId>com.example</groupId>
+      <artifactId>code-review-plugin</artifactId>
+      <version>1.1.0</version>
+      <configuration>
+        <modelId>anthropic.claude-3-sonnet-20240229-v1:0</modelId>
+        <region>us-east-1</region>
+        <failOnError>false</failOnError>
+      </configuration>
+    </plugin>
+  </plugins>
+</build>
+
+Run:
+
+mvn codereview:analyze
+open target/code-review-report.html
+
+
+---
+
+✅ That’s the AWS Bedrock version:
+
+No Ollama needed
+
+Uses Claude Sonnet (or Llama/Mistral) via Bedrock
+
+Same interactive HTML UI
+
+
+
+---
+
+Do you want me to also wire in a SARIF exporter so these review comments appear directly in GitHub Actions or Azure DevOps CI pipelines?
+
