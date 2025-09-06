@@ -21,3 +21,46 @@ public class JsonExtractor {
 }
 
 Pattern.compile("(\\[.*\\])", Pattern.DOTALL);
+
+
+
+___________________
+
+@SuppressWarnings("unchecked")
+private static String serialize(Object o) {
+    if (o == null) return "null";
+
+    if (o instanceof String s) {
+        return "\"" + s
+                .replace("\\", "\\\\")
+                .replace("\"", "\\\"")
+                .replace("\r", "\\r")
+                .replace("\n", "\\n") + "\"";
+    }
+
+    if (o instanceof Number || o instanceof Boolean) return o.toString();
+
+    if (o instanceof Map<?, ?> m) {
+        return "{" + m.entrySet().stream()
+                .map(e -> serialize(e.getKey().toString()) + ":" + serialize(e.getValue()))
+                .collect(Collectors.joining(",")) + "}";
+    }
+
+    if (o instanceof Collection<?> c) {
+        return "[" + c.stream().map(HtmlReportGenerator::serialize).collect(Collectors.joining(",")) + "]";
+    }
+
+    // POJOs (like ReviewComment)
+    try {
+        Map<String, Object> m = new LinkedHashMap<>();
+        for (var f : o.getClass().getFields()) {
+            Object value = f.get(o);
+            if (value == null) value = "";  // Replace null with empty string to avoid broken JSON
+            m.put(f.getName(), value);
+        }
+        return serialize(m);
+    } catch (Exception e) {
+        // fallback to empty object instead of invalid JSON
+        return "{}";
+    }
+}
