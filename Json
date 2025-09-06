@@ -1,0 +1,21 @@
+public class JsonExtractor {
+    private static final Pattern JSON_ARRAY_PATTERN =
+            Pattern.compile("(\.*\)", Pattern.DOTALL);
+
+    public static String extractJsonArray(String input) {
+        if (input == null) return null;
+
+        // Remove markdown fences if present
+        String cleaned = input.replaceAll("(?s)```json", "")
+                              .replaceAll("(?s)```", "")
+                              .trim();
+
+        // Extract the JSON array
+        Matcher m = JSON_ARRAY_PATTERN.matcher(cleaned);
+        if (m.find()) {
+            return m.group(1).trim();
+        }
+
+        return null;
+    }
+}
