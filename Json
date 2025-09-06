@@ -64,3 +64,66 @@ private static String serialize(Object o) {
         return "{}";
     }
 }
+
+
+
+_____________
+
+
+// Helper to escape JSON for HTML <script> embedding
+private static String escapeForHtmlScript(String json) {
+    return json.replace("<", "\\u003C")
+               .replace(">", "\\u003E")
+               .replace("&", "\\u0026");
+}
+
+@SuppressWarnings("unchecked")
+private static String serialize(Object o) {
+    if (o == null) return "null";
+
+    if (o instanceof String s) {
+        String escaped = s
+                .replace("\\", "\\\\")
+                .replace("\"", "\\\"")
+                .replace("\r", "\\r")
+                .replace("\n", "\\n")
+                .replace("</script>", "<\\/script>"); // prevent HTML break
+        return "\"" + escaped + "\"";
+    }
+
+    if (o instanceof Number || o instanceof Boolean) return o.toString();
+
+    if (o instanceof Map<?, ?> map) {
+        return "{" + map.entrySet().stream()
+                .map(e -> serialize(e.getKey().toString()) + ":" + serialize(e.getValue()))
+                .collect(Collectors.joining(",")) + "}";
+    }
+
+    if (o instanceof Collection<?> col) {
+        return "[" + col.stream().map(HtmlReportGenerator::serialize).collect(Collectors.joining(",")) + "]";
+    }
+
+    if (o.getClass().isArray()) {
+        int len = java.lang.reflect.Array.getLength(o);
+        StringBuilder sb = new StringBuilder("[");
+        for (int i = 0; i < len; i++) {
+            if (i > 0) sb.append(",");
+            sb.append(serialize(java.lang.reflect.Array.get(o, i)));
+        }
+        sb.append("]");
+        return sb.toString();
+    }
+
+    // Fallback for POJOs
+    try {
+        Map<String, Object> m = new LinkedHashMap<>();
+        var fields = o.getClass().getDeclaredFields();
+        for (var f : fields) {
+            f.setAccessible(true); // include private fields
+            m.put(f.getName(), f.get(o));
+        }
+        return serialize(m);
+    } catch (Exception e) {
+        return "\"" + o.toString().replace("\"", "\\\"") + "\"";
+    }
+}
