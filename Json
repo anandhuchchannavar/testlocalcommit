@@ -19,3 +19,5 @@ public class JsonExtractor {
         return null;
     }
 }
+
+Pattern.compile("(\\[.*\\])", Pattern.DOTALL);
